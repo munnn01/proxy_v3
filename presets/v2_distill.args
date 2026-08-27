@@ -1,0 +1,33 @@
+# Clean-video distillation, feature matching and the hybrid distortion loss.
+# This is the v2 default objective, isolated so it can be compared against
+# @presets/v1_parity.args one change at a time.
+#
+# eta = 0.25 puts three quarters of the distortion weight on MSE(processed, source).
+# That term is minimized at processed == source, so it is an identity regularizer,
+# not a smoothing incentive. It buys bitrate by paying Top-1, which is the trade
+# earlier per-QP-lambda runs already measured as a loss. Prefer
+# @presets/v3_masked_rate.args if the goal is lower bitrate.
+
+--preprocessor swin
+--swin-qp-conditioning
+--swin-qp-embed-dim 64
+--max-residual 0.25
+
+--codec h264
+--codec-qps 30 35 40 45
+
+--alpha 10
+--rate-lambda 0.05
+--distortion-reconstruction-weight 0.25
+--ce-weight 1.0
+--kd-weight 0.5
+--kd-temperature 2.0
+--feature-weight 0.05
+--feature-layer layer4
+--mask-rate-weight 0
+
+--optimizer adamw
+--weight-decay 0.01
+--lr 0.0001
+--clip-grad 1.0
+--checkpoint-metric task_bd_rate

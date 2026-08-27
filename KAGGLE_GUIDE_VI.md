@@ -7,8 +7,8 @@ dẫn khác, sau đó chọn **Run All**.
 
 ```python
 %cd /kaggle/working
-!git clone -q https://github.com/munnn01/film_deeper3d_v2.git
-%cd /kaggle/working/film_deeper3d_v2
+!git clone -q https://github.com/munnn01/proxy_v3.git
+%cd /kaggle/working/proxy_v3
 %pip install -q --no-cache-dir -r requirements.txt
 ```
 
@@ -16,10 +16,11 @@ dẫn khác, sau đó chọn **Run All**.
 
 ```python
 DATA = "/kaggle/input/datasets/rohanmallick/kinetics-train-5per/kinetics400_5per/kinetics400_5per/train"
-PROJECT = "/kaggle/working/film_deeper3d_v2"
+PROJECT = "/kaggle/working/proxy_v3"
 PROXY_DIR = "/kaggle/working/checkpoints/h264_film_deeper3d"
 CACHE_DIR = "/kaggle/working/precomputed_codec/h264"
-MODEL_DIR = "/kaggle/working/checkpoints/video_swin_v2_kd_feature_hybrid"
+MODEL_DIR = "/kaggle/working/checkpoints/v3_masked_rate"
+CONTROL_DIR = "/kaggle/working/checkpoints/v1_parity"
 EVAL_DIR = "/kaggle/working/real_codec_eval"
 VIS_DIR = "/kaggle/working/visualization"
 ```
@@ -109,25 +110,17 @@ video nén. Khi quota `/kaggle/working` không đủ, thêm `--limit-train N` v�
 Proxy shallow cũ không tương thích với kiến trúc này, vì vậy phải train từ epoch 1
 với `PROXY_DIR` mới. Cache codec đã tạo trước đây vẫn dùng lại được.
 
-## Cell 6 — Train Video Swin Lite preprocessor
+## Cell 6a — Run đối chứng (bắt buộc chạy trước)
+
+Preset `v1_parity` tái tạo đúng objective của run tốt nhất đã đo được
+(Task BD-rate −2.73%). Vì mặc định của v2 đã đổi loss, mọi số của v2/v3 chỉ có
+nghĩa khi so với run đối chứng này trên cùng `--limit-train/--limit-val` và cùng
+số epoch.
 
 ```python
-!python -u "$PROJECT/train.py" \
+!python -u "$PROJECT/train.py" @"$PROJECT/presets/v1_parity.args" \
   --data-root "$DATA" \
   --proxy-checkpoint "$PROXY_DIR/best.pt" \
-  --preprocessor swin \
-  --swin-patch-size 4 \
-  --swin-embed-dim 48 \
-  --swin-depth 4 \
-  --swin-heads 4 \
-  --swin-window-temporal 4 \
-  --swin-window-spatial 8 \
-  --swin-qp-conditioning \
-  --swin-qp-embed-dim 64 \
-  --max-residual 0.10 \
-  --codec h264 \
-  --codec-qps 30 35 40 45 \
-  --qp-sampling-weights 0.15 0.25 0.30 0.30 \
   --codec-fps 30 \
   --codec-preset medium \
   --frames 16 \
@@ -139,36 +132,72 @@ với `PROXY_DIR` mới. Cache codec đã tạo trước đây vẫn dùng lại
   --batch-size 2 \
   --accumulation-steps 4 \
   --workers 4 \
-  --optimizer adamw \
-  --lr 0.0001 \
-  --alpha 10 \
-  --rate-lambda 0.05 \
-  --distortion-reconstruction-weight 0.25 \
-  --ce-weight 1.0 \
-  --kd-weight 0.5 \
-  --kd-temperature 2.0 \
-  --feature-weight 0.05 \
-  --feature-layer layer4 \
-  --weight-decay 0.01 \
-  --clip-grad 1.0 \
-  --checkpoint-metric task_bd_rate \
+  --amp \
+  --output-dir "$CONTROL_DIR"
+```
+
+## Cell 6b — Train Video Swin Lite với masked rate penalty
+
+```python
+!python -u "$PROJECT/train.py" @"$PROJECT/presets/v3_masked_rate.args" \
+  --data-root "$DATA" \
+  --proxy-checkpoint "$PROXY_DIR/best.pt" \
+  --codec-fps 30 \
+  --codec-preset medium \
+  --frames 16 \
+  --frame-stride 2 \
+  --frame-size 128 \
+  --limit-train 2000 \
+  --limit-val 400 \
+  --epochs 10 \
+  --batch-size 2 \
+  --accumulation-steps 4 \
+  --workers 4 \
   --amp \
   --output-dir "$MODEL_DIR"
 ```
 
-Video Swin nhận QP đang dùng và FiLM-modulate từng block, đồng thời điều khiển
-cường độ residual theo QP. Vì kiến trúc preprocessor thay đổi, hãy dùng một
-`MODEL_DIR` mới và train từ epoch 1. FiLM deeper-3D proxy cùng cache codec cũ vẫn
-dùng lại được. Một giá trị `--rate-lambda` sẽ được dùng chung cho mọi QP; bốn
-giá trị sẽ ánh xạ lần lượt theo thứ tự của `--codec-qps`. V2 dùng đồng thời CE,
-clean-logit KD, feature matching ở `layer4` và distortion lai. Tập giới hạn được
-lấy gần cân bằng theo lớp. Validation chạy toàn bộ 400 clip ở cả bốn QP, còn
-anchor được codec thật đo một lần rồi lưu ở `anchor_validation.json`.
+Preset giữ objective, dòng lệnh chỉ giữ tham số môi trường. Có thể ghi đè bất cứ
+flag nào của preset bằng cách thêm nó vào sau, ví dụ `--mask-rate-weight 4.0`.
+
+Bốn preset có sẵn:
+
+| Preset | Objective |
+| --- | --- |
+| `presets/v1_parity.args` | đối chứng: `eta=1`, không KD, không feature, không masked |
+| `presets/v2_distill.args` | mặc định v2: `eta=0.25`, KD 0.5, feature 0.05 |
+| `presets/v3_masked_rate.args` | `eta=1`, KD 0.5, feature 0.05, masked TV trên output |
+| `presets/v3_masked_rate_conservative.args` | masked TV chỉ trên residual, chỉ trong vùng crop |
+
+Ba điểm cần đọc trong log:
+
+- `[setup] QP sampling: uniform over [30, 35, 40, 45]`. Không đặt
+  `--qp-sampling-weights`. Với bốn QP, BD-rate khớp đa thức bậc 3 qua bốn điểm nên
+  đó là nội suy chính xác với 0 bậc tự do; lệch trọng số là tối ưu cho sai số của
+  phép khớp, không phải cho đường cong. Ngoài ra CE ở QP 45 đã lớn nhất nên gradient
+  tự động nghiêng về QP cao, và cửa sổ tích phân BD-rate nằm chủ yếu trong dải
+  QP 30-40 nên bỏ đói QP 30 làm mất tín hiệu ở đúng vùng đang đo.
+- `[setup] analyzer view: rows 8:120 cols 22:106 of 128x128 (57.4% of every frame)`.
+  Analyzer chỉ nhìn 57.4% mỗi frame; 42.6% còn lại vẫn tốn bit nhưng không thể ảnh
+  hưởng tới dự đoán. `--mask-rate-outside-weight 1.0` cho phép làm phẳng vùng đó.
+  Đây là đòn bpp mạnh nhất hiện có, và cũng là chỗ người đọc dễ phản biện nhất, nên
+  phải nói rõ trong luận văn hoặc đặt cờ này về `0.0`.
+- `mask_rate` trong dòng `train=` / `valid=`. Giá trị thực tế khoảng 0.05-0.15.
+  Chọn `--mask-rate-weight` theo gradient chứ không theo giá trị loss: ở MSE 0.002
+  sai số tuyệt đối trung bình khoảng 0.045 nên `alpha * d(MSE)/dz` xấp xỉ 0.9 mỗi
+  pixel, tức `--mask-rate-weight 1.0` tạo áp lực tương đương. Quét 0.25, 1, 4.
+
+`--limit-val 400` chỉ dùng để xếp hạng epoch. Trên tập 400 clip, `bpp` sai khoảng
+0.06 điểm nhưng Top-1 bị lạc quan khoảng 0.69 điểm, tương đương 2.3 điểm BD-rate.
+Sau khi chọn được cấu hình tốt nhất, đo lại trên toàn bộ validation trước khi báo
+cáo. Tỉ giá đã đo trên pipeline này: 1 điểm Top-1 bằng 3.3 điểm BD-rate, 1 điểm bpp
+bằng 0.95 điểm BD-rate.
 
 Mỗi run lưu `best_loss.pt`, `best_ce.pt`, `best_top1.pt` và
-`best_task_bd_rate.pt`. Với lệnh trên, `best.pt` chính là checkpoint có validation
-Top-1 BD-rate thấp nhất. Để ablation chỉ KD trước, đặt `--feature-weight 0`; để tái
-tạo loss v1, thêm `--kd-weight 0 --feature-weight 0 --distortion-reconstruction-weight 1`.
+`best_task_bd_rate.pt`; `best.pt` theo `--checkpoint-metric`, mặc định là Task
+BD-rate. Validation chạy toàn bộ clip ở cả bốn QP, còn anchor được codec thật đo
+một lần rồi lưu ở `anchor_validation.json`. Tập giới hạn được lấy gần cân bằng
+theo lớp.
 
 ## Cell 7 — Đánh giá codec thật
 
@@ -181,6 +210,10 @@ tạo loss v1, thêm `--kd-weight 0 --feature-weight 0 --distortion-reconstructi
   --device cuda \
   --output-dir "$EVAL_DIR"
 ```
+
+Chạy lại đúng cell này với `--checkpoint "$CONTROL_DIR/best.pt"` và
+`--output-dir "$EVAL_DIR/v1_parity"` để có số đối chứng. Chỉ so hai kết quả cùng
+đo trên toàn bộ validation.
 
 Khi không có `val/`, script tự đọc `val_ratio` và `seed` trong checkpoint để tái
 tạo đúng validation phân tầng trong bộ nhớ; không cần tạo `EVAL_DATA`, symlink hay
@@ -215,7 +248,7 @@ danh sách Top-5.
 
 ```python
 %cd /kaggle/working
-!zip -qr film_deeper3d_v2_results.zip checkpoints real_codec_eval visualization
+!zip -qr proxy_v3_results.zip checkpoints real_codec_eval visualization
 ```
 
 ## Cell 10 — Link tải xuống
@@ -223,5 +256,5 @@ danh sách Top-5.
 ```python
 from IPython.display import FileLink
 
-FileLink("/kaggle/working/film_deeper3d_v2_results.zip")
+FileLink("/kaggle/working/proxy_v3_results.zip")
 ```

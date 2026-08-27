@@ -1,4 +1,4 @@
-# Video Swin Lite v2 with clean distillation and Task BD-rate selection
+# Video Swin Lite v3: masked-rate preprocessing with Task BD-rate selection
 
 Task-aware video preprocessing with the requested pipeline kept intact:
 
@@ -82,13 +82,14 @@ suppress expensive texture without forcing high QPs to use the same residual.
 Evaluation reconstructs the QP-specific preprocessed clip before every real-codec
 operating point. Legacy checkpoints without QP parameters remain loadable.
 
-## V2 objective
+## V3 objective
 
 ```text
 L = alpha * (L_D_hybrid + lambda * L_R)
     + w_CE * CE(labels)
     + w_KD * KD(reconstruction, clean video)
     + w_F * cosine_feature_loss(layer4)
+    + w_M * masked_total_variation(preprocessed clip)
 ```
 
 - `L_D_hybrid = eta*MSE(reconstruction, source) + (1-eta)*MSE(processed, source)`.
@@ -97,12 +98,113 @@ L = alpha * (L_D_hybrid + lambda * L_R)
 - Feature matching uses channel-normalized `layer4` activations from the same
   frozen analyzer. Clean targets are detached; gradients pass through the
   reconstruction/analyzer/proxy only to Video Swin Lite.
+- The masked term is new in v3 and is described below. It defaults to zero, so an
+  unchanged command line reproduces the v2 objective exactly.
+- Optional `--normalize-rate-by-anchor` divides BPP by the fixed validation anchor
+  at the current QP. It is a relative-rate surrogate, not the BD-rate integral, and
+  needs a smaller separately tuned lambda.
 
-V2 defaults are `eta=0.25`, `w_CE=1`, `w_KD=0.5`, `T=2`, and `w_F=0.05`.
-Set `--kd-weight 0 --feature-weight 0 --distortion-reconstruction-weight 1`
-to reproduce the v1 loss. Optional `--normalize-rate-by-anchor` divides BPP by
-the fixed validation anchor at the current QP; this is a relative-rate surrogate,
-not the BD-rate integral, and needs a smaller separately tuned lambda.
+### The masked rate penalty
+
+Every measured run so far *increased* bitrate: the preprocessor learned to be an
+enhancement filter, buying Top-1 with bits. `lambda * bpp` cannot fix that. Over
+QP 30-45 the whole rate term spans roughly 0.010-0.012, so raising lambda scales a
+term with almost no dynamic range, and it reaches the preprocessor only through the
+frozen proxy's rate head.
+
+`--mask-rate-weight` adds a term that has both properties the scalar lacks. It is
+spatially resolved, and it is an exact analytic gradient with no proxy in the path:
+
+```text
+w_M * weighted_mean( m_ij * ( |dx z| + |dy z| + |dt z| ) )
+m = 1 - normalized(|clean layer4 activation|)   inside the analyzer crop
+m = --mask-rate-outside-weight                  outside it
+```
+
+H.264 spends bits on spatial and temporal detail, so an L1 penalty on the gradients
+of the preprocessed clip is a differentiable stand-in for bitrate that a per-pixel
+weight can steer. The weight comes from the frozen analyzer's own activation energy
+on the *clean* clip, so it is a detached constant: regions the analyzer relies on
+are left alone, and quiet regions become cheap to flatten. Each finite difference
+takes the smaller of its two endpoint weights, so detail bordering a protected
+pixel stays protected.
+
+Two options control how aggressive it is:
+
+- `--mask-rate-target output` (default) penalizes detail in the preprocessed clip,
+  so it can push bitrate below the anchor. `residual` penalizes only `z - x`, which
+  stops the preprocessor from *adding* detail but can never remove any.
+- `--mask-rate-outside-weight` covers the border the analyzer never sees. On
+  128x128 input the `r3d_18` preset resizes to 128x171 and center-crops 112x112, so
+  the analyzer only sees rows 8:120 and columns 22:106, that is **57.4% of every
+  frame**. The other 42.6% costs bits that cannot change the prediction. Training
+  prints this box at startup. Flattening it is a real saving under this evaluation
+  protocol, and it is also the part a reader is most likely to call exploiting the
+  evaluation crop, so report it explicitly or set the flag to `0.0`.
+
+Choose `w_M` by comparing gradients, not loss values. At MSE 0.002 the mean absolute
+reconstruction error is about 0.045, so `alpha * d(MSE)/dz` is near
+`2 * 10 * 0.045 = 0.9` per pixel; `--mask-rate-weight 1.0` applies comparable
+pressure. Sweep 0.25, 1, 4. The logged `mask_rate` value itself sits near 0.05-0.15
+for real video, between a smooth gradient (0.07) and uniform noise (0.33).
+
+Set `--distortion-reconstruction-weight 1.0` when the masked term is on. `eta < 1`
+adds `MSE(processed, source)`, whose minimum is at `processed == source`; it is an
+identity regularizer, not a smoothing incentive, and it pulls directly against the
+masked penalty.
+
+### Presets and the experiment ladder
+
+`train.py` accepts `@file` presets, one flag per line, with `#` comments allowed:
+
+```bash
+python -u train.py @presets/v1_parity.args \
+  --data-root /path/to/kinetics/train \
+  --proxy-checkpoint checkpoints/h264_proxy/best.pt \
+  --output-dir checkpoints/v1_parity
+```
+
+| Preset | Objective |
+| --- | --- |
+| `presets/v1_parity.args` | control run: `eta=1`, no KD, no feature loss, no masked term |
+| `presets/v2_distill.args` | v2 defaults: `eta=0.25`, KD 0.5, feature 0.05 |
+| `presets/v3_masked_rate.args` | `eta=1`, KD 0.5, feature 0.05, masked TV on the output |
+| `presets/v3_masked_rate_conservative.args` | masked TV on the residual only, inside the crop only |
+
+Run the control first. The v2 defaults already changed the loss, so a v2 or v3
+number cannot be compared against an older run until the control has been measured
+in this repository with the same data limits and epoch count.
+
+### QP sampling
+
+Leave `--qp-sampling-weights` unset. Uniform sampling is the default and the
+recommendation, for three separate reasons:
+
+1. With four QPs, `calculate_bd_rate` fits `degree = min(3, len(quality)-1) = 3`
+   through four points. That is exact interpolation with zero degrees of freedom,
+   and the per-QP leverage ordering flips between a degree-2 and a degree-3 fit. A
+   sampling tilt therefore optimizes a property of the fit, not of the curve.
+2. Cross-entropy is already largest at QP 45, so the gradient is self-weighted
+   toward high QP. Adding a sampling tilt double-counts that.
+3. The BD-rate integral runs over the shared quality window
+   `[Top1_proposed(QP45), Top1_anchor(QP30)]`. Gains at QP 45 raise the lower bound
+   of that window, and most of its content sits in the QP 30-40 band, so starving
+   QP 30 removes training signal from the region actually being measured.
+
+Training prints the effective sampling distribution at startup.
+
+### Reading the numbers
+
+`--limit-val 400` is a pilot setting, not a measurement. On this dataset a 400-clip
+validation subset reproduces `bpp` to about 0.06 points but inflates Top-1 by about
+0.69 points, which is roughly 2.3 BD points. Use the limited run to rank epochs and
+configurations, then re-measure the winner on the full split before reporting it.
+Training prints a warning when `--limit-val` and `--checkpoint-metric task_bd_rate`
+are combined.
+
+The measured exchange rate on this pipeline is 1 Top-1 point per 3.3 BD points and
+1 bpp point per 0.95 BD points, so accuracy is worth about 3.4 times bitrate. A run
+that trades 1 point of Top-1 for 3% of bitrate is a net loss.
 
 ## Requirements
 
@@ -165,7 +267,26 @@ Start FiLM deeper-3D training at epoch 1 with a new output directory. Existing
 precomputed codec caches remain fully reusable because their real reconstruction
 and BPP targets are architecture-independent.
 
-Then train Video Swin Lite through the real codec and frozen proxy:
+Then train Video Swin Lite through the real codec and frozen proxy. A preset carries
+the objective; the command line carries only the environment:
+
+```bash
+python -u train.py @presets/v3_masked_rate.args \
+  --data-root /path/to/kinetics/train \
+  --proxy-checkpoint checkpoints/h264_proxy/best.pt \
+  --codec-fps 30 \
+  --codec-preset medium \
+  --frames 16 \
+  --frame-stride 2 \
+  --frame-size 128 \
+  --epochs 30 \
+  --batch-size 1 \
+  --accumulation-steps 4 \
+  --workers 4 \
+  --output-dir checkpoints/preprocessor
+```
+
+The same run written out in full, without a preset:
 
 ```bash
 python -u train.py \
@@ -180,15 +301,18 @@ python -u train.py \
   --swin-window-spatial 8 \
   --swin-qp-conditioning \
   --swin-qp-embed-dim 64 \
+  --max-residual 0.25 \
   --codec h264 \
   --codec-qps 30 35 40 45 \
-  --qp-sampling-weights 0.15 0.25 0.30 0.30 \
-  --distortion-reconstruction-weight 0.25 \
+  --distortion-reconstruction-weight 1.0 \
   --ce-weight 1.0 \
   --kd-weight 0.5 \
   --kd-temperature 2.0 \
   --feature-weight 0.05 \
   --feature-layer layer4 \
+  --mask-rate-weight 1.0 \
+  --mask-rate-target output \
+  --mask-rate-layer layer4 \
   --optimizer adamw \
   --weight-decay 0.01 \
   --alpha 10 \
@@ -266,6 +390,7 @@ python model_summary.py \
 - `precompute_codec.py`: deterministic train/val uint8 codec cache and pipe verification.
 - `train_proxy.py`: distill the proxy from real codec outputs and measured BPP.
 - `train.py`: train only the preprocessor with rate-distortion-task loss.
+- `presets/*.args`: the objective of each rung of the experiment ladder.
 - `preprocessing/evaluation.py`: reproducible held-out split and BD-rate helpers.
 - `model_summary.py`: torchinfo summaries for preprocessor and proxy.
 - `evaluate_real_codec.py`: real-codec metrics, Top-1/BPP plots and BD-rate.

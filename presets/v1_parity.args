@@ -1,0 +1,36 @@
+# Control run: the objective of the best measured experiment so far
+# (Task BD-rate -2.73%, lambda=0.05 with QP conditioning).
+# Every v3 change must be compared against this, because the v2 defaults already
+# changed the loss and their numbers are not comparable to older runs.
+#
+# Environment flags stay on the command line:
+#   --data-root --proxy-checkpoint --output-dir --frames --frame-stride --frame-size
+#   --epochs --batch-size --accumulation-steps --workers --limit-train --limit-val
+#
+# python -u train.py @presets/v1_parity.args --data-root ... --proxy-checkpoint ...
+
+--preprocessor swin
+--swin-qp-conditioning
+--swin-qp-embed-dim 64
+--max-residual 0.25
+
+--codec h264
+--codec-qps 30 35 40 45
+
+# Uniform QP sampling. Four QPs make the BD-rate fit an exact interpolation, so a
+# sampling tilt optimizes the fit rather than the curve.
+# --qp-sampling-weights is intentionally omitted.
+
+--alpha 10
+--rate-lambda 0.05
+--distortion-reconstruction-weight 1.0
+--ce-weight 1.0
+--kd-weight 0
+--feature-weight 0
+--mask-rate-weight 0
+
+--optimizer adam
+--weight-decay 0.0
+--lr 0.0001
+--clip-grad 1.0
+--checkpoint-metric task_bd_rate

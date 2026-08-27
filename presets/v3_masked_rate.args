@@ -1,0 +1,52 @@
+# The v3 proposal: keep full post-codec fidelity, add a spatially targeted rate
+# penalty instead of pulling the preprocessed clip back toward the source.
+#
+# Why: every run so far raised bitrate. A single scalar lambda*bpp has a dynamic
+# range of about 0.010-0.012 over these QPs, so it cannot express "spend fewer
+# bits here and more bits there". The masked total variation can: it penalizes
+# spatial and temporal detail exactly where the frozen analyzer does not look.
+# It also reaches the preprocessor as an exact analytic gradient, while lambda*bpp
+# can only arrive through the frozen proxy's rate head.
+#
+# On 128x128 input the r3d_18 preset resizes to 128x171 and crops 112x112, so the
+# analyzer only sees rows 8:120 and columns 22:106, that is 57.4% of every frame.
+# The remaining 42.6% costs bits that cannot change the prediction.
+#
+# Weight scale: compare gradients, not loss values. At MSE 0.002 the mean absolute
+# reconstruction error is about 0.045, so alpha * d(MSE)/dz is near 2*10*0.045 =
+# 0.9 per pixel. A masked-TV weight of 1.0 applies comparable pressure. Sweep
+# 0.25, 1, 4. The logged mask_rate itself lands near 0.05-0.15 for real video.
+
+--preprocessor swin
+--swin-qp-conditioning
+--swin-qp-embed-dim 64
+--max-residual 0.25
+
+--codec h264
+--codec-qps 30 35 40 45
+
+--alpha 10
+--rate-lambda 0.05
+
+# eta = 1.0: MSE against the source is measured after the codec only. The masked
+# penalty is now the term that suppresses expensive detail, so the identity pull
+# of MSE(processed, source) is not needed and would fight it.
+--distortion-reconstruction-weight 1.0
+
+--ce-weight 1.0
+--kd-weight 0.5
+--kd-temperature 2.0
+--feature-weight 0.05
+--feature-layer layer4
+
+--mask-rate-weight 1.0
+--mask-rate-target output
+--mask-rate-layer layer4
+--mask-rate-gamma 1.0
+--mask-rate-outside-weight 1.0
+
+--optimizer adamw
+--weight-decay 0.01
+--lr 0.0001
+--clip-grad 1.0
+--checkpoint-metric task_bd_rate

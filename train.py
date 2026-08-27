@@ -74,6 +74,126 @@ def compression_loss(
     )
 
 
+def analyzer_view_box(
+    transform: object, height: int, width: int
+) -> tuple[int, int, int, int] | None:
+    """Return ``(top, left, view_h, view_w)`` of the analyzer view in source pixels.
+
+    Torchvision video presets resize a clip to ``resize_size`` and then center-crop
+    to ``crop_size``, so the frozen analyzer never sees the frame border. Pixels
+    outside that box cannot change the prediction, yet they still cost bits.
+    Returns ``None`` for transforms that do not expose the preset attributes.
+    """
+
+    resize_size = getattr(transform, "resize_size", None)
+    crop_size = getattr(transform, "crop_size", None)
+    if not resize_size or not crop_size:
+        return None
+    resize = [int(value) for value in resize_size]
+    if len(resize) >= 2:
+        resized_h, resized_w = resize[0], resize[1]
+    elif height <= width:
+        resized_h, resized_w = resize[0], max(1, round(width * resize[0] / height))
+    else:
+        resized_h, resized_w = max(1, round(height * resize[0] / width)), resize[0]
+    crop = [int(value) for value in crop_size]
+    crop_h, crop_w = (crop[0], crop[1]) if len(crop) >= 2 else (crop[0], crop[0])
+    crop_h, crop_w = min(crop_h, resized_h), min(crop_w, resized_w)
+    scale_y, scale_x = height / resized_h, width / resized_w
+    top = int(round(((resized_h - crop_h) // 2) * scale_y))
+    left = int(round(((resized_w - crop_w) // 2) * scale_x))
+    view_h = max(1, min(height - top, int(round(crop_h * scale_y))))
+    view_w = max(1, min(width - left, int(round(crop_w * scale_x))))
+    return top, left, view_h, view_w
+
+
+def build_rate_weight(
+    feature: torch.Tensor,
+    frames: int,
+    height: int,
+    width: int,
+    *,
+    box: tuple[int, int, int, int] | None = None,
+    gamma: float = 1.0,
+    outside_weight: float = 1.0,
+) -> torch.Tensor:
+    """Return detached per-pixel rate weights in ``[0, 1]`` shaped ``[B,T,1,H,W]``.
+
+    ``feature`` is a frozen-analyzer activation ``[B,C,T',H',W']`` measured on the
+    clean clip, so the weight is a constant and no gradient reaches it. High
+    activation energy means the analyzer relies on that region, so its weight
+    approaches zero and the rate penalty leaves it alone. Pixels outside the
+    analyzer's own crop receive ``outside_weight``.
+    """
+
+    energy = feature.detach().float().abs().mean(dim=1, keepdim=True)
+    inner_h, inner_w = (height, width) if box is None else (box[2], box[3])
+    energy = F.interpolate(
+        energy, size=(frames, inner_h, inner_w), mode="trilinear", align_corners=False
+    )
+    lowest = energy.amin(dim=(2, 3, 4), keepdim=True)
+    highest = energy.amax(dim=(2, 3, 4), keepdim=True)
+    saliency = ((energy - lowest) / (highest - lowest).clamp_min(1e-6)).clamp(0.0, 1.0)
+    if gamma != 1.0:
+        saliency = saliency.pow(gamma)
+    inner = 1.0 - saliency
+    if box is None:
+        weight = inner
+    else:
+        top, left, view_h, view_w = box
+        weight = energy.new_full(
+            (energy.shape[0], 1, frames, height, width), float(outside_weight)
+        )
+        weight[..., top : top + view_h, left : left + view_w] = inner
+    return weight.permute(0, 2, 1, 3, 4)
+
+
+def masked_total_variation(target: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Return the weighted mean absolute spatio-temporal gradient of ``target``.
+
+    H.264 spends bits on spatial and temporal detail, so this is a differentiable
+    stand-in for bitrate that a per-pixel weight can steer, unlike the single
+    scalar ``lambda * bpp``. Each finite difference takes the smaller of its two
+    endpoint weights, so detail bordering a protected pixel stays protected.
+    """
+
+    if target.ndim != 5 or weight.ndim != 5:
+        raise ValueError("masked_total_variation expects [B,T,C,H,W] tensors")
+    total = target.new_zeros(())
+    counted = target.new_zeros(())
+    differences = (
+        (
+            target[..., 1:] - target[..., :-1],
+            torch.minimum(weight[..., 1:], weight[..., :-1]),
+        ),
+        (
+            target[..., 1:, :] - target[..., :-1, :],
+            torch.minimum(weight[..., 1:, :], weight[..., :-1, :]),
+        ),
+        (
+            target[:, 1:] - target[:, :-1],
+            torch.minimum(weight[:, 1:], weight[:, :-1]),
+        ),
+    )
+    for difference, pair_weight in differences:
+        if difference.numel() == 0:
+            continue
+        total = total + (pair_weight * difference.abs()).sum()
+        counted = counted + pair_weight.expand_as(difference).sum()
+    return total / counted.clamp_min(1e-6)
+
+
+def clean_feature_layers(args: argparse.Namespace) -> list[str]:
+    """Return the analyzer layers that must be captured on the clean clip."""
+
+    layers: list[str] = []
+    if float(getattr(args, "feature_weight", 0.0)) > 0:
+        layers.append(str(getattr(args, "feature_layer", "layer4")))
+    if float(getattr(args, "mask_rate_weight", 0.0)) > 0:
+        layers.append(str(getattr(args, "mask_rate_layer", "layer4")))
+    return list(dict.fromkeys(layers))
+
+
 def build_qp_lambda_map(
     codec_qps: list[int], rate_lambdas: list[float]
 ) -> dict[int, float]:
@@ -96,8 +216,16 @@ def build_qp_lambda_map(
     return dict(zip(codec_qps, rate_lambdas, strict=True))
 
 
+class PresetArgumentParser(argparse.ArgumentParser):
+    """Parser whose ``@preset`` files allow comments and several tokens per line."""
+
+    def convert_arg_line_to_args(self, arg_line: str):
+        line = arg_line.split("#", 1)[0].strip()
+        return line.split() if line else []
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = PresetArgumentParser(description=__doc__, fromfile_prefix_chars="@")
     data = parser.add_argument_group("data")
     data.add_argument("--data-root", help="root containing train/ and optionally val/ folders")
     data.add_argument("--train-dir", help="explicit class-folder training directory")
@@ -191,6 +319,35 @@ def parse_args() -> argparse.Namespace:
         help="named frozen-analyzer module used for feature matching",
     )
     optimization.add_argument(
+        "--mask-rate-weight",
+        type=float,
+        default=0.0,
+        help="saliency-masked total-variation rate penalty weight; zero disables it",
+    )
+    optimization.add_argument(
+        "--mask-rate-layer",
+        default="layer4",
+        help="frozen-analyzer module whose clean activation energy builds the mask",
+    )
+    optimization.add_argument(
+        "--mask-rate-target",
+        choices=("output", "residual"),
+        default="output",
+        help="penalize detail in the preprocessed clip, or only detail it adds",
+    )
+    optimization.add_argument(
+        "--mask-rate-gamma",
+        type=float,
+        default=1.0,
+        help="exponent sharpening the saliency map; above one protects only its peaks",
+    )
+    optimization.add_argument(
+        "--mask-rate-outside-weight",
+        type=float,
+        default=1.0,
+        help="weight for pixels outside the analyzer crop; zero ignores that border",
+    )
+    optimization.add_argument(
         "--normalize-rate-by-anchor",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -200,7 +357,8 @@ def parse_args() -> argparse.Namespace:
         "--qp-sampling-weights",
         type=float,
         nargs="+",
-        help="optional non-negative training sampling weights matching --codec-qps",
+        help="optional training sampling weights matching --codec-qps; omit for the "
+        "recommended uniform sampling",
     )
     optimization.add_argument("--optimizer", choices=("adam", "adamw"), default="adam")
     optimization.add_argument("--weight-decay", type=float, default=0.0)
@@ -377,12 +535,37 @@ def forward_losses(
                 proposed_feature * reference_feature
             ).sum(dim=1).mean()
 
+        mask_rate_loss = logits.new_zeros((), dtype=torch.float32)
+        mask_rate_weight = float(getattr(args, "mask_rate_weight", 0.0))
+        if mask_rate_weight > 0:
+            mask_layer = str(getattr(args, "mask_rate_layer", "layer4"))
+            if clean_features is None or mask_layer not in clean_features:
+                raise ValueError(
+                    "the masked rate penalty is enabled but clean features are missing"
+                )
+            _, frames, _, height, width = clips.shape
+            rate_weight = build_rate_weight(
+                clean_features[mask_layer],
+                frames,
+                height,
+                width,
+                box=analyzer_view_box(
+                    getattr(analyzer, "transform", None), height, width
+                ),
+                gamma=float(getattr(args, "mask_rate_gamma", 1.0)),
+                outside_weight=float(getattr(args, "mask_rate_outside_weight", 1.0)),
+            )
+            target = processed.float()
+            if str(getattr(args, "mask_rate_target", "output")) == "residual":
+                target = target - clips.float()
+            mask_rate_loss = masked_total_variation(target, rate_weight)
+
         accuracy_loss = (
             float(getattr(args, "ce_weight", 1.0)) * ce_loss
             + kd_weight * kd_loss
             + feature_weight * feature_loss
         )
-        total = rd_loss + accuracy_loss
+        total = rd_loss + accuracy_loss + mask_rate_weight * mask_rate_loss
     return {
         "total": total,
         "distortion": distortion,
@@ -393,6 +576,7 @@ def forward_losses(
         "ce_loss": ce_loss,
         "kd_loss": kd_loss,
         "feature_loss": feature_loss,
+        "mask_rate_loss": mask_rate_loss,
         "logits": logits,
     }
 
@@ -423,6 +607,7 @@ def run_epoch(
         "ce_loss",
         "kd_loss",
         "feature_loss",
+        "mask_rate",
         "clean_ce",
     )
     meters = {name: AverageMeter() for name in meter_names}
@@ -434,10 +619,8 @@ def run_epoch(
     }
     per_qp_correct = {qp: {"top1": 0, "top5": 0, "examples": 0} for qp in args.codec_qps}
     use_amp = bool(args.amp and device.type == "cuda")
-    need_clean = (
-        float(getattr(args, "kd_weight", 0.0)) > 0
-        or float(getattr(args, "feature_weight", 0.0)) > 0
-    )
+    clean_layers = clean_feature_layers(args)
+    need_clean = float(getattr(args, "kd_weight", 0.0)) > 0 or bool(clean_layers)
     if training:
         optimizer.zero_grad(set_to_none=True)
 
@@ -464,9 +647,9 @@ def run_epoch(
             clean_features: dict[str, torch.Tensor] | None = None
             if need_clean:
                 with torch.no_grad():
-                    if float(getattr(args, "feature_weight", 0.0)) > 0:
+                    if clean_layers:
                         clean_logits, clean_features = analyzer.forward_with_features(
-                            clips, [str(getattr(args, "feature_layer", "layer4"))]
+                            clips, clean_layers
                         )
                     else:
                         clean_logits = analyzer(clips)
@@ -522,6 +705,7 @@ def run_epoch(
                 meters["ce_loss"].update(float(losses["ce_loss"].detach()), batch)
                 meters["kd_loss"].update(float(losses["kd_loss"].detach()), batch)
                 meters["feature_loss"].update(float(losses["feature_loss"].detach()), batch)
+                meters["mask_rate"].update(float(losses["mask_rate_loss"].detach()), batch)
                 correct1 += top1
                 correct5 += top5
                 examples += batch
@@ -547,6 +731,7 @@ def run_epoch(
         "ce_loss": meters["ce_loss"].average,
         "kd_loss": meters["kd_loss"].average,
         "feature_loss": meters["feature_loss"].average,
+        "mask_rate": meters["mask_rate"].average,
         "top1": correct1 / max(examples, 1),
         "top5": correct5 / max(examples, 1),
     }
@@ -689,6 +874,12 @@ def main() -> None:
         raise ValueError("CE, KD and feature weights must be non-negative")
     if args.kd_temperature <= 0:
         raise ValueError("--kd-temperature must be positive")
+    if args.mask_rate_weight < 0:
+        raise ValueError("--mask-rate-weight must be non-negative")
+    if args.mask_rate_gamma <= 0:
+        raise ValueError("--mask-rate-gamma must be positive")
+    if not 0.0 <= args.mask_rate_outside_weight <= 1.0:
+        raise ValueError("--mask-rate-outside-weight must be in [0, 1]")
     if args.qp_sampling_weights is not None:
         if len(args.qp_sampling_weights) != len(args.codec_qps):
             raise ValueError(
@@ -710,7 +901,41 @@ def main() -> None:
         f"feature={args.feature_weight}@{args.feature_layer} "
         f"distortion_eta={args.distortion_reconstruction_weight}"
     )
+    if args.mask_rate_weight > 0:
+        print(
+            "[setup] masked rate penalty "
+            f"weight={args.mask_rate_weight} target={args.mask_rate_target} "
+            f"mask={args.mask_rate_layer} gamma={args.mask_rate_gamma} "
+            f"outside={args.mask_rate_outside_weight}"
+        )
+    if args.qp_sampling_weights is None:
+        print(f"[setup] QP sampling: uniform over {args.codec_qps}")
+    else:
+        total_weight = float(sum(args.qp_sampling_weights))
+        shares = {
+            qp: round(weight / total_weight, 3)
+            for qp, weight in zip(args.codec_qps, args.qp_sampling_weights, strict=True)
+        }
+        print(f"[setup] QP sampling shares={shares}")
+        print(
+            "[setup] uniform sampling is the v3 default: with four QPs the BD-rate "
+            "polynomial interpolates exactly, so a tilt optimizes a fit artifact"
+        )
+    if args.limit_val is not None and args.checkpoint_metric == "task_bd_rate":
+        print(
+            f"[warn] Task BD-rate is being selected on {args.limit_val} validation "
+            "clips. Top-1 on a small subset is optimistic by roughly one point, which "
+            "is a few BD points. Rank epochs here, then confirm on the full split."
+        )
     analyzer = FrozenVideoAnalyzer(args.analyzer).to(device)
+    view_box = analyzer_view_box(analyzer.transform, args.frame_size, args.frame_size)
+    if view_box is not None:
+        top, left, view_h, view_w = view_box
+        share = (view_h * view_w) / float(args.frame_size * args.frame_size)
+        print(
+            f"[setup] analyzer view: rows {top}:{top + view_h} cols {left}:{left + view_w} "
+            f"of {args.frame_size}x{args.frame_size} ({share:.1%} of every frame)"
+        )
     train_loader, val_loader = make_loaders(args, analyzer.categories)
     preprocessor = build_preprocessor(
         args.preprocessor,
