@@ -1,0 +1,45 @@
+# Per-QP dual rate control. The Video Swin preprocessor is already conditioned
+# on QP; this preset also adapts an independent masked-TV multiplier at each QP.
+# Start at a conservative 2% bitrate saving. Override --target-bpp-ratio on the
+# command line for the later 0.95 and 0.92 feasibility runs.
+
+--preprocessor swin
+--swin-qp-conditioning
+--swin-qp-embed-dim 64
+--max-residual 0.25
+
+--codec h264
+--codec-qps 30 35 40 45
+
+--alpha 10
+--rate-lambda 0.05
+--distortion-reconstruction-weight 1.0
+
+--ce-weight 1.0
+--kd-weight 0.5
+--kd-temperature 2.0
+--feature-weight 0.05
+--feature-layer layer4
+
+# Penalize output detail inside the analyzer view. outside=0 is the defensible
+# headline protocol; crop exploitation can be reported later as an ablation.
+--mask-rate-weight 1.0
+--mask-rate-target output
+--mask-rate-layer layer4
+--mask-rate-gamma 1.0
+--mask-rate-outside-weight 0.0
+
+--dual-rate-control
+--target-bpp-ratio 0.98
+--dual-kappa 3.0
+--dual-ema-beta 0.8
+--dual-warmup-epochs 2
+--mask-rate-min 0.05
+--mask-rate-max 20.0
+--dual-feasibility-tolerance 0.01
+
+--optimizer adamw
+--weight-decay 0.01
+--lr 0.0001
+--clip-grad 1.0
+--checkpoint-metric task_bd_rate

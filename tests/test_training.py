@@ -14,9 +14,13 @@ from train import (
     build_rate_weight,
     clean_feature_layers,
     compression_loss,
+    dual_mask_weights,
+    initialize_dual_rate_state,
     masked_total_variation,
     parse_args,
     run_epoch,
+    update_dual_rate_state,
+    validation_bpp_ratios,
     validation_task_bd_rate,
 )
 
@@ -62,6 +66,57 @@ def test_build_qp_lambda_map_accepts_per_qp_values():
 def test_build_qp_lambda_map_rejects_mismatched_lengths():
     with pytest.raises(ValueError, match="one value per"):
         build_qp_lambda_map([30, 35, 40, 45], [0.05, 0.1])
+
+
+def test_dual_mask_weights_are_qp_specific_and_warm_up():
+    state = initialize_dual_rate_state([30, 45], initial_weight=2.0)
+    state["log_w_mask_by_qp"][45] = torch.log(torch.tensor(4.0)).item()
+    assert dual_mask_weights(state, [30, 45], epoch=1, warmup_epochs=2) == pytest.approx(
+        {30: 1.0, 45: 2.0}
+    )
+    assert dual_mask_weights(state, [30, 45], epoch=2, warmup_epochs=2) == pytest.approx(
+        {30: 2.0, 45: 4.0}
+    )
+
+
+def test_dual_update_increases_and_decreases_independent_qp_weights():
+    state = initialize_dual_rate_state([30, 45], initial_weight=1.0)
+    weights = update_dual_rate_state(
+        state,
+        {30: 1.05, 45: 0.90},
+        target_ratio=0.98,
+        kappa=3.0,
+        ema_beta=0.8,
+        minimum_weight=0.5,
+        maximum_weight=2.0,
+    )
+    assert weights[30] > 1.0
+    assert weights[45] < 1.0
+    assert state["ema_ratio_by_qp"] == {30: 1.05, 45: 0.90}
+
+
+def test_dual_update_clamps_weights_and_uses_ema():
+    state = initialize_dual_rate_state([30], initial_weight=1.0)
+    state["ema_ratio_by_qp"][30] = 1.0
+    weights = update_dual_rate_state(
+        state,
+        {30: 10.0},
+        target_ratio=0.5,
+        kappa=100.0,
+        ema_beta=0.5,
+        minimum_weight=0.25,
+        maximum_weight=2.0,
+    )
+    assert weights[30] == pytest.approx(2.0)
+    assert state["ema_ratio_by_qp"][30] == pytest.approx(5.5)
+
+
+def test_validation_bpp_ratios_reports_per_qp_and_ratio_of_means():
+    anchor = {"qp30_bpp": 0.4, "qp45_bpp": 0.1}
+    proposed = {"qp30_bpp": 0.36, "qp45_bpp": 0.08}
+    ratios, mean_ratio = validation_bpp_ratios(anchor, proposed, [30, 45])
+    assert ratios == pytest.approx({30: 0.9, 45: 0.8})
+    assert mean_ratio == pytest.approx(0.88)
 
 
 class _RecordingPreprocessor(nn.Module):
