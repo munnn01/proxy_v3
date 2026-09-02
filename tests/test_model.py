@@ -11,8 +11,10 @@ from preprocessing.data import (
     stratified_split_indices,
 )
 from preprocessing.evaluation import (
+    bootstrap_bd_rate,
     build_evaluation_dataset,
     calculate_bd_rate,
+    calculate_bd_rate_details,
     dataset_sample_path,
 )
 from preprocessing.model import PaperPreprocessor, VideoTransformerPreprocessor
@@ -296,6 +298,24 @@ def test_bd_rate_reports_known_twenty_percent_saving():
     assert calculate_bd_rate(rows, "quality") == pytest.approx(-20.0, abs=1e-6)
 
 
+def test_bd_rate_details_report_pchip_overlap_and_effective_points():
+    rows = []
+    for method, scale in (("anchor", 1.0), ("preprocessed", 0.9)):
+        for quality, rate in zip((30.0, 40.0, 50.0), (0.1, 0.2, 0.4)):
+            rows.append(
+                {"method": method, "bpp": rate * scale, "quality": quality}
+            )
+
+    details = calculate_bd_rate_details(rows, "quality")
+    assert details["interpolation"] == "pchip"
+    assert details["anchor_points"] == 3
+    assert details["preprocessed_points"] == 3
+    assert details["quality_min"] == pytest.approx(30.0)
+    assert details["quality_max"] == pytest.approx(50.0)
+    assert details["overlap_span"] == pytest.approx(20.0)
+    assert details["bd_rate_percent"] == pytest.approx(-10.0, abs=1e-6)
+
+
 def test_bd_rate_is_undefined_for_flat_task_accuracy():
     rows = [
         {"method": method, "bpp": rate, "top1": 50.0}
@@ -303,6 +323,57 @@ def test_bd_rate_is_undefined_for_flat_task_accuracy():
         for rate in (0.1, 0.2, 0.3, 0.4)
     ]
     assert calculate_bd_rate(rows, "top1") is None
+
+
+def test_paired_bootstrap_preserves_known_rate_scaling():
+    rows = []
+    qualities = (30.0, 40.0, 50.0, 60.0)
+    rates = (0.1, 0.2, 0.4, 0.8)
+    for sample_index in range(6):
+        for method, scale in (("anchor", 1.0), ("preprocessed", 0.8)):
+            for qp, (quality, rate) in enumerate(zip(qualities, rates, strict=True)):
+                rows.append(
+                    {
+                        "sample_index": sample_index,
+                        "method": method,
+                        "qp": qp,
+                        "bpp": rate * scale,
+                        "mse": 10.0 ** (-quality / 10.0),
+                        "top1": int(qp >= 2),
+                    }
+                )
+
+    uncertainty = bootstrap_bd_rate(
+        rows, "psnr_db", samples=100, confidence_level=0.95, seed=7
+    )
+    assert uncertainty["samples_valid"] == 100
+    assert uncertainty["point_estimate_percent"] == pytest.approx(-20.0, abs=1e-6)
+    assert uncertainty["median_percent"] == pytest.approx(-20.0, abs=1e-6)
+    assert uncertainty["lower_percent"] == pytest.approx(-20.0, abs=1e-6)
+    assert uncertainty["upper_percent"] == pytest.approx(-20.0, abs=1e-6)
+
+
+def test_paired_bootstrap_rejects_incomplete_operating_points():
+    rows = [
+        {
+            "sample_index": 0,
+            "method": "anchor",
+            "qp": 30,
+            "bpp": 0.2,
+            "mse": 0.01,
+            "top1": 1,
+        },
+        {
+            "sample_index": 1,
+            "method": "preprocessed",
+            "qp": 30,
+            "bpp": 0.18,
+            "mse": 0.01,
+            "top1": 1,
+        },
+    ]
+    with pytest.raises(ValueError, match="every video at every method/QP"):
+        bootstrap_bd_rate(rows, "psnr_db", samples=10)
 
 
 def test_precomputed_codec_dataset_reuses_one_uint8_source_for_all_qps(tmp_path):

@@ -17,7 +17,12 @@ matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 
 from preprocessing import FrozenVideoAnalyzer, StandardVideoCodec, build_preprocessor
-from preprocessing.evaluation import build_evaluation_dataset, calculate_bd_rate
+from preprocessing.evaluation import (
+    bootstrap_bd_rate,
+    build_evaluation_dataset,
+    calculate_bd_rate_details,
+    dataset_sample_path,
+)
 from preprocessing.utils import topk_correct, write_json
 
 
@@ -43,7 +48,13 @@ def parse_args() -> argparse.Namespace:
         choices=("h264", "h265"),
         default=["h264", "h265"],
     )
-    parser.add_argument("--qps", nargs="+", type=int, default=[30, 35, 40, 45])
+    parser.add_argument(
+        "--qps",
+        nargs="+",
+        type=int,
+        default=[30, 32, 35, 37, 40, 42, 45],
+        help="dense operating points improve BD-rate reliability",
+    )
     parser.add_argument("--frames", type=int, default=16)
     parser.add_argument("--frame-stride", type=int, default=2)
     parser.add_argument("--frame-size", type=int, default=128)
@@ -57,6 +68,14 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="measure frozen-analyzer accuracy before the codec and show it on plots",
     )
+    parser.add_argument(
+        "--bootstrap-samples",
+        type=int,
+        default=2000,
+        help="paired video-level bootstrap repetitions; use 0 to disable",
+    )
+    parser.add_argument("--bootstrap-seed", type=int, default=2026)
+    parser.add_argument("--confidence-level", type=float, default=0.95)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", default="outputs/real_codec")
     return parser.parse_args()
@@ -66,6 +85,17 @@ def format_bd_rate(value: float | None) -> str:
     return "undefined" if value is None else f"{value:+.2f}%"
 
 
+def format_bd_rate_interval(uncertainty: dict[str, object] | None) -> str:
+    if not uncertainty:
+        return ""
+    lower = uncertainty.get("lower_percent")
+    upper = uncertainty.get("upper_percent")
+    if lower is None or upper is None:
+        return ""
+    confidence = 100.0 * float(uncertainty["confidence_level"])
+    return f" ({confidence:.0f}% CI {float(lower):+.2f}% to {float(upper):+.2f}%)"
+
+
 def save_rate_accuracy_plot(
     path: Path,
     rows: list[dict[str, float | int | str]],
@@ -73,6 +103,7 @@ def save_rate_accuracy_plot(
     task_bd_rate: float | None,
     psnr_bd_rate: float | None,
     clean_top1_percent: float | None = None,
+    task_uncertainty: dict[str, object] | None = None,
 ) -> None:
     colors = {"anchor": "#E45756", "preprocessed": "#4C78A8"}
     labels = {"anchor": "Anchor", "preprocessed": "Video Swin preprocessor"}
@@ -139,7 +170,8 @@ def save_rate_accuracy_plot(
         axis.grid(alpha=0.3)
         axis.legend()
     figure.suptitle(
-        f"{codec.upper()} | Task BD-rate: {format_bd_rate(task_bd_rate)} | "
+        f"{codec.upper()} | Task BD-rate: {format_bd_rate(task_bd_rate)}"
+        f"{format_bd_rate_interval(task_uncertainty)} | "
         f"PSNR BD-rate: {format_bd_rate(psnr_bd_rate)}",
         fontsize=14,
     )
@@ -154,6 +186,7 @@ def save_top1_bd_rate_plot(
     codec: str,
     task_bd_rate: float | None,
     clean_top1_percent: float | None = None,
+    task_uncertainty: dict[str, object] | None = None,
 ) -> None:
     """Write a presentation-ready Top-1/BPP curve with one BD-rate value."""
 
@@ -194,7 +227,10 @@ def save_top1_bd_rate_plot(
     axis.set(
         xlabel="Bitrate (BPP)",
         ylabel="Top-1 accuracy (%)",
-        title=f"{codec.upper()} Top-1 BD-rate: {format_bd_rate(task_bd_rate)}",
+        title=(
+            f"{codec.upper()} Top-1 BD-rate: {format_bd_rate(task_bd_rate)}"
+            f"{format_bd_rate_interval(task_uncertainty)}"
+        ),
     )
     axis.grid(alpha=0.3)
     axis.legend()
@@ -221,6 +257,14 @@ def real_codec_roundtrip(
 
 def main() -> None:
     args = parse_args()
+    if not args.qps or len(set(args.qps)) != len(args.qps):
+        raise ValueError("--qps must contain at least one unique value")
+    if any(qp < 0 or qp > 51 for qp in args.qps):
+        raise ValueError("--qps values must lie in [0, 51]")
+    if args.bootstrap_samples < 0:
+        raise ValueError("--bootstrap-samples must be non-negative")
+    if not 0.0 < args.confidence_level < 1.0:
+        raise ValueError("--confidence-level must lie strictly between zero and one")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
     device = torch.device(args.device)
@@ -271,41 +315,91 @@ def main() -> None:
         lambda: {"videos": 0, "bpp": 0.0, "mse": 0.0, "top1": 0, "top5": 0}
     )
     clean_totals = {"videos": 0, "top1": 0, "top5": 0}
-
-    for clip, label in tqdm(dataset, desc="real codec evaluation"):
-        source = clip.to(device).unsqueeze(0)
-        label_tensor = torch.tensor([label], device=device)
-        if args.include_clean_reference:
-            with torch.no_grad():
-                clean_logits = analyzer(source)
-            clean_totals["videos"] += 1
-            clean_totals["top1"] += topk_correct(clean_logits, label_tensor, 1)
-            clean_totals["top5"] += topk_correct(clean_logits, label_tensor, 5)
-        for qp in args.qps:
-            # A QP-conditioned preprocessor emits a distinct clip for each
-            # operating point. Legacy/CNN/ViT preprocessors simply ignore QP.
-            with torch.no_grad():
-                proposed = preprocessor(source, qp)[0].cpu()
-            for codec in args.codecs:
-                for method, input_clip in (("anchor", clip), ("preprocessed", proposed)):
-                    decoded, bpp = real_codec_roundtrip(
-                        input_clip,
-                        codec,
-                        qp,
-                        codec_fps,
-                        preset=codec_preset,
-                        ffmpeg=args.ffmpeg,
-                    )
-                    decoded_device = decoded.to(device).unsqueeze(0)
-                    with torch.no_grad():
-                        logits = analyzer(decoded_device)
-                    key = (codec, qp, method)
-                    row = totals[key]
-                    row["videos"] += 1
-                    row["bpp"] += bpp
-                    row["mse"] += float(F.mse_loss(decoded_device, source))
-                    row["top1"] += topk_correct(logits, label_tensor, 1)
-                    row["top5"] += topk_correct(logits, label_tensor, 5)
+    per_video_rows: list[dict[str, float | int | str]] = []
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    per_video_path = output / "per_video_metrics.csv"
+    per_video_fields = [
+        "sample_index",
+        "source",
+        "label",
+        "codec",
+        "qp",
+        "method",
+        "bpp",
+        "mse",
+        "top1",
+        "top5",
+    ]
+    with per_video_path.open("w", newline="", encoding="utf-8") as stream:
+        per_video_writer = csv.DictWriter(stream, fieldnames=per_video_fields)
+        per_video_writer.writeheader()
+        iterator = enumerate(tqdm(dataset, desc="real codec evaluation"))
+        for sample_index, (clip, label) in iterator:
+            source_path = str(dataset_sample_path(dataset, sample_index))
+            source = clip.to(device).unsqueeze(0)
+            label_tensor = torch.tensor([label], device=device)
+            if args.include_clean_reference:
+                with torch.no_grad():
+                    clean_logits = analyzer(source)
+                clean_totals["videos"] += 1
+                clean_totals["top1"] += topk_correct(clean_logits, label_tensor, 1)
+                clean_totals["top5"] += topk_correct(clean_logits, label_tensor, 5)
+            for qp in args.qps:
+                # A QP-conditioned preprocessor emits a distinct clip for each
+                # operating point. Legacy/CNN/ViT preprocessors simply ignore QP.
+                with torch.no_grad():
+                    proposed = preprocessor(source, qp)[0].cpu()
+                for codec in args.codecs:
+                    for method, input_clip in (
+                        ("anchor", clip),
+                        ("preprocessed", proposed),
+                    ):
+                        decoded, bpp = real_codec_roundtrip(
+                            input_clip,
+                            codec,
+                            qp,
+                            codec_fps,
+                            preset=codec_preset,
+                            ffmpeg=args.ffmpeg,
+                        )
+                        decoded_device = decoded.to(device).unsqueeze(0)
+                        with torch.no_grad():
+                            logits = analyzer(decoded_device)
+                        mse = float(F.mse_loss(decoded_device, source))
+                        top1 = topk_correct(logits, label_tensor, 1)
+                        top5 = topk_correct(logits, label_tensor, 5)
+                        key = (codec, qp, method)
+                        row = totals[key]
+                        row["videos"] += 1
+                        row["bpp"] += bpp
+                        row["mse"] += mse
+                        row["top1"] += top1
+                        row["top5"] += top5
+                        sample_row: dict[str, float | int | str] = {
+                            "sample_index": sample_index,
+                            "source": source_path,
+                            "label": int(label),
+                            "codec": codec,
+                            "qp": qp,
+                            "method": method,
+                            "bpp": bpp,
+                            "mse": mse,
+                            "top1": top1,
+                            "top5": top5,
+                        }
+                        per_video_writer.writerow(sample_row)
+                        per_video_rows.append(
+                            {
+                                "sample_index": sample_index,
+                                "codec": codec,
+                                "qp": qp,
+                                "method": method,
+                                "bpp": bpp,
+                                "mse": mse,
+                                "top1": top1,
+                            }
+                        )
 
     rows = []
     for (codec, qp, method), values in sorted(totals.items()):
@@ -325,8 +419,6 @@ def main() -> None:
                 "top5": values["top5"] / count,
             }
         )
-    output = Path(args.output_dir)
-    output.mkdir(parents=True, exist_ok=True)
     clean_metrics = None
     if clean_totals["videos"]:
         clean_count = int(clean_totals["videos"])
@@ -347,15 +439,65 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
     print(f"wrote {output / 'metrics.csv'}")
+    print(f"wrote {per_video_path}")
+
+    write_json(
+        output / "evaluation_config.json",
+        {
+            "schema_version": 1,
+            "checkpoint": str(Path(args.checkpoint).resolve()),
+            "videos": len(dataset),
+            "codecs": list(args.codecs),
+            "qps": list(args.qps),
+            "frames": args.frames,
+            "frame_stride": args.frame_stride,
+            "frame_size": args.frame_size,
+            "codec_fps": codec_fps,
+            "codec_preset": codec_preset,
+            "stream_scope": "one_elementary_stream_per_clip",
+            "bpp_includes_elementary_stream_headers": True,
+            "keyint": "clip_frame_count",
+            "scene_cut": False,
+            "analyzer": analyzer_name,
+            "preprocessor": preprocessor_kind,
+            "bd_rate_interpolation": "pchip",
+            "bootstrap_samples": args.bootstrap_samples,
+            "bootstrap_seed": args.bootstrap_seed,
+            "confidence_level": args.confidence_level,
+        },
+    )
 
     bd_rates = {}
     for codec in args.codecs:
         codec_rows = [row for row in rows if row["codec"] == codec]
-        task_bd_rate = calculate_bd_rate(codec_rows, "top1_percent")
-        psnr_bd_rate = calculate_bd_rate(codec_rows, "psnr_db")
+        codec_sample_rows = [
+            row for row in per_video_rows if row["codec"] == codec
+        ]
+        task_details = calculate_bd_rate_details(codec_rows, "top1_percent")
+        psnr_details = calculate_bd_rate_details(codec_rows, "psnr_db")
+        task_bd_rate = task_details["bd_rate_percent"]
+        psnr_bd_rate = psnr_details["bd_rate_percent"]
+        task_uncertainty = bootstrap_bd_rate(
+            codec_sample_rows,
+            "top1_percent",
+            samples=args.bootstrap_samples,
+            confidence_level=args.confidence_level,
+            seed=args.bootstrap_seed,
+        )
+        psnr_uncertainty = bootstrap_bd_rate(
+            codec_sample_rows,
+            "psnr_db",
+            samples=args.bootstrap_samples,
+            confidence_level=args.confidence_level,
+            seed=args.bootstrap_seed + 1,
+        )
         bd_rates[codec] = {
             "task_bd_rate_percent": task_bd_rate,
             "psnr_bd_rate_percent": psnr_bd_rate,
+            "task_details": task_details,
+            "psnr_details": psnr_details,
+            "task_bootstrap": task_uncertainty,
+            "psnr_bootstrap": psnr_uncertainty,
         }
         plot_path = output / f"{codec}_top1_bpp_bd_rate.png"
         save_rate_accuracy_plot(
@@ -365,6 +507,7 @@ def main() -> None:
             task_bd_rate,
             psnr_bd_rate,
             None if clean_metrics is None else float(clean_metrics["top1_percent"]),
+            task_uncertainty,
         )
         top1_plot_path = output / f"{codec}_top1_bd_rate.png"
         save_top1_bd_rate_plot(
@@ -373,9 +516,11 @@ def main() -> None:
             codec,
             task_bd_rate,
             None if clean_metrics is None else float(clean_metrics["top1_percent"]),
+            task_uncertainty,
         )
         print(
-            f"[{codec}] task BD-rate={format_bd_rate(task_bd_rate)} "
+            f"[{codec}] task BD-rate={format_bd_rate(task_bd_rate)}"
+            f"{format_bd_rate_interval(task_uncertainty)} "
             f"PSNR BD-rate={format_bd_rate(psnr_bd_rate)}"
         )
         print(f"wrote {plot_path}")

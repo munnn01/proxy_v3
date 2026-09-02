@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "video-machine-preprocessing"
-version = "0.7.0"
-description = "Task-BD-selected Video Swin Lite with a saliency-masked rate penalty"
+version = "0.8.0"
+description = "Task-BD-selected Video Swin Lite with PCHIP and paired-bootstrap evaluation"
 requires-python = ">=3.10"
 dependencies = [
   "matplotlib>=3.7",

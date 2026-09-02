@@ -1,4 +1,4 @@
-# Video Swin Lite v3: masked-rate preprocessing with Task BD-rate selection
+# Video Swin Lite v3: direct-rate preprocessing with reliable Task BD-rate evaluation
 
 Task-aware video preprocessing with the requested pipeline kept intact:
 
@@ -214,10 +214,9 @@ in this repository with the same data limits and epoch count.
 Leave `--qp-sampling-weights` unset. Uniform sampling is the default and the
 recommendation, for three separate reasons:
 
-1. With four QPs, `calculate_bd_rate` fits `degree = min(3, len(quality)-1) = 3`
-   through four points. That is exact interpolation with zero degrees of freedom,
-   and the per-QP leverage ordering flips between a degree-2 and a degree-3 fit. A
-   sampling tilt therefore optimizes a property of the fit, not of the curve.
+1. Training and controller measurements still use four QPs. Tilting their sampling
+   would reduce coverage of an already sparse rate-accuracy curve. Final evaluation
+   uses seven denser operating points and shape-preserving PCHIP interpolation.
 2. Cross-entropy is already largest at QP 45, so the gradient is self-weighted
    toward high QP. Adding a sampling tilt double-counts that.
 3. The BD-rate integral runs over the shared quality window
@@ -406,17 +405,36 @@ python -u evaluate_real_codec.py \
   --checkpoint checkpoints/preprocessor/best.pt \
   --data-root /path/to/kinetics/train \
   --codecs h264 \
-  --qps 30 35 40 45 \
+  --qps 30 32 35 37 40 42 45 \
+  --bootstrap-samples 2000 \
   --device cuda \
   --output-dir outputs/real_codec
 ```
 
 The output includes `metrics.csv`, `metrics.json`, `clean_metrics.json`,
-`bd_rate.json`, a focused `<codec>_top1_bd_rate.png`, and the three-panel
-`<codec>_top1_bpp_bd_rate.png`. Task BD-rate uses Top-1 as the
-quality axis; PSNR BD-rate is also reported. Negative BD-rate means bitrate
-saving at equal quality. Task BD-rate is reported as undefined when discrete
-Top-1 curves have too few distinct points or no overlapping accuracy range.
+`per_video_metrics.csv`, `evaluation_config.json`, `bd_rate.json`, a focused
+`<codec>_top1_bd_rate.png`, and the three-panel
+`<codec>_top1_bpp_bd_rate.png`. Task and PSNR BD-rate use shape-preserving PCHIP
+interpolation over the common quality range. `bd_rate.json` records the effective
+point count, overlap interval, and a paired video-level bootstrap confidence
+interval. Negative BD-rate means bitrate saving at equal quality. Task BD-rate is
+reported as undefined when discrete Top-1 curves have too few distinct points or
+no overlapping accuracy range.
+
+The paired bootstrap resamples complete videos, so anchor and preprocessed results
+at every QP remain coupled within each draw. Set `--bootstrap-samples 0` for a quick
+diagnostic run only. The evaluator writes every per-video measurement before
+aggregation, preserving the inputs needed for independent audit or re-bootstrap
+without rerunning FFmpeg. `evaluation_config.json` explicitly records that each
+sample is a separate elementary stream, BPP includes stream headers, keyint equals
+clip length, and scene-cut is disabled.
+
+The evaluation update follows the piecewise-cubic and denser-sampling guidance in
+the [Bjontegaard Delta tutorial](https://arxiv.org/abs/2401.04039),
+[The Bjontegaard Bible](https://arxiv.org/abs/2304.12852), and
+[Rethinking Bjontegaard Delta](https://arxiv.org/abs/2410.12220). Top-1 remains a
+finite-sample, stepwise task metric, so use its confidence interval and raw RD curve
+rather than the point estimate alone.
 
 Omit `--limit` for the final result. `--limit 200` is useful for a faster pilot,
 but produces noisier Top-1 and task BD-rate estimates. The limit applies only to

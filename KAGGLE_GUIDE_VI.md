@@ -206,7 +206,8 @@ theo lớp.
   --checkpoint "$MODEL_DIR/best.pt" \
   --data-root "$DATA" \
   --codecs h264 \
-  --qps 30 35 40 45 \
+  --qps 30 32 35 37 40 42 45 \
+  --bootstrap-samples 2000 \
   --device cuda \
   --output-dir "$EVAL_DIR"
 ```
@@ -220,9 +221,12 @@ tạo đúng validation phân tầng trong bộ nhớ; không cần tạo `EVAL_
 dùng cache precompute. Mặc định script đánh giá toàn bộ validation và ghi:
 
 - `metrics.csv`, `metrics.json`: BPP, MSE, PSNR, Top-1 và Top-5 theo từng QP.
+- `per_video_metrics.csv`: số đo ghép cặp của từng video để audit/bootstrap lại.
 - `clean_metrics.json`: Top-1/Top-5 của clip sạch trước codec.
-- `bd_rate.json`: Task BD-rate theo Top-1 và BD-rate chuẩn theo PSNR.
-- `h264_top1_bd_rate.png`: riêng đường BPP–Top-1, bốn QP và một Task BD-rate.
+- `evaluation_config.json`: protocol codec, QP, seed và cấu hình bootstrap.
+- `bd_rate.json`: Task/PSNR BD-rate dùng PCHIP, khoảng overlap và paired-bootstrap
+  confidence interval 95%.
+- `h264_top1_bd_rate.png`: riêng đường BPP–Top-1, bảy QP và Task BD-rate kèm CI.
 - `h264_top1_bpp_bd_rate.png`: biểu đồ QP-BPP, BPP-Top-1 và BPP-PSNR.
 
 Chỉ thêm `--limit 200` khi cần chạy thử nhanh. Kết quả báo cáo chính thức nên bỏ
