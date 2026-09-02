@@ -7,7 +7,8 @@ video -> Video Swin Lite -> H.264/H.265 -> reconstruction
       -> frozen analyzer -> task
 ```
 
-During training, a frozen differentiable proxy runs beside the real codec:
+In the legacy V1-V4 training path, a frozen differentiable proxy runs beside the
+real codec:
 
 ```text
                             +-> frozen codec proxy -- backward gradients --+
@@ -16,8 +17,8 @@ video -> trainable preprocessor -> real H.264/H.265 -> reconstruction ------+
                                                     -> frozen analyzer -> task
 ```
 
-The real FFmpeg codec always determines reconstruction and measured BPP in the
-forward pass. The proxy supplies only the backward Jacobian:
+The real FFmpeg codec determines reconstruction and measured BPP in that path.
+The proxy supplies only the backward Jacobian:
 
 ```python
 reconstruction = proxy_reconstruction + (
@@ -30,6 +31,12 @@ bpp = proxy_bpp + (real_bpp - proxy_bpp).detach()
 Consequently, task and rate-distortion loss values correspond to the standard
 codec while gradients still reach only the preprocessor. Codec proxy and analyzer
 parameters remain frozen.
+
+V5 adds a faster direct-rate path. Training batches use the frozen proxy for both
+the differentiable reconstruction and BPP, while a deterministic validation subset
+is encoded by real FFmpeg once per epoch. Exact per-QP BPP ratios from that subset
+update the dual multipliers, and proxy-versus-real BPP drift is logged. Final model
+claims must still come from `evaluate_real_codec.py` on the full validation split.
 
 ## FiLM deeper-3D proxy
 
@@ -104,6 +111,32 @@ L = alpha * (L_D_hybrid + lambda * L_R)
   at the current QP. It is a relative-rate surrogate, not the BD-rate integral, and
   needs a smaller separately tuned lambda.
 
+## V5 direct-rate objective
+
+`presets/v5_direct_rate.args` removes FFmpeg from the per-batch training loop and
+puts the per-QP dual multiplier on the proxy's anchor-normalized BPP directly:
+
+```text
+L_train(q) = alpha * MSE(proxy_reconstruction, source)
+             + CE + w_KD*KD + w_F*feature_loss
+             + mu_q * (proxy_bpp / anchor_bpp_q - target_ratio)
+```
+
+The cached `anchor_bpp_q` and the controller measurement both come from real H.264
+on the same stratified `--controller-limit-val` subset. At the end of each epoch:
+
+```text
+mu_q <- clip(mu_q * exp(kappa * (EMA(real_bpp_q / anchor_bpp_q) - target_ratio)))
+```
+
+Initial multipliers use
+`mu_q = alpha * rate_dual_parity_lambda * anchor_bpp_q`, so their raw-BPP gradient
+coefficient exactly matches the old `alpha * lambda * bpp` term. The scheduler uses
+a fixed initial-multiplier monitor loss rather than the changing training loss.
+Resume checkpoints include a versioned controller state and reject changes to QPs,
+codec, target, proxy/real training source, controller hyperparameters, or calibrated
+initial weights. A V4 checkpoint therefore cannot be resumed as V5.
+
 ### The masked rate penalty
 
 Every measured run so far *increased* bitrate: the preprocessor learned to be an
@@ -170,6 +203,7 @@ python -u train.py @presets/v1_parity.args \
 | `presets/v2_distill.args` | v2 defaults: `eta=0.25`, KD 0.5, feature 0.05 |
 | `presets/v3_masked_rate.args` | `eta=1`, KD 0.5, feature 0.05, masked TV on the output |
 | `presets/v3_masked_rate_conservative.args` | masked TV on the residual only, inside the crop only |
+| `presets/v5_direct_rate.args` | proxy-only train batches plus real-codec per-QP direct dual calibration |
 
 Run the control first. The v2 defaults already changed the loss, so a v2 or v3
 number cannot be compared against an older run until the control has been measured
@@ -284,6 +318,26 @@ python -u train.py @presets/v3_masked_rate.args \
   --accumulation-steps 4 \
   --workers 4 \
   --output-dir checkpoints/preprocessor
+```
+
+For the recommended V5 experiment, start a fresh output directory and replace the
+preset. Training batches then avoid FFmpeg; the 400-clip real-codec controller pass
+still runs at every epoch:
+
+```bash
+python -u train.py @presets/v5_direct_rate.args \
+  --data-root /path/to/kinetics/train \
+  --proxy-checkpoint checkpoints/h264_proxy/best.pt \
+  --codec-fps 30 \
+  --codec-preset medium \
+  --frames 16 \
+  --frame-stride 2 \
+  --frame-size 128 \
+  --epochs 30 \
+  --batch-size 2 \
+  --accumulation-steps 4 \
+  --workers 4 \
+  --output-dir checkpoints/v5_direct_rate_098
 ```
 
 The same run written out in full, without a preset:

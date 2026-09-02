@@ -308,6 +308,150 @@ def update_dual_rate_state(
     return {qp: math.exp(float(log_weights[qp])) for qp in ratios}
 
 
+RATE_DUAL_STATE_VERSION = 1
+
+
+def build_rate_dual_initial_weights(
+    codec_qps: list[int],
+    anchor_bpp_by_qp: dict[int, float],
+    *,
+    alpha: float,
+    parity_lambda: float,
+) -> dict[int, float]:
+    """Match the raw-BPP gradient coefficient of ``alpha * parity_lambda``."""
+
+    if alpha <= 0 or parity_lambda <= 0:
+        raise ValueError("rate-dual alpha and parity lambda must be positive")
+    return {
+        qp: alpha * parity_lambda * float(anchor_bpp_by_qp[qp]) for qp in codec_qps
+    }
+
+
+def initialize_rate_dual_state(
+    initial_weights: dict[int, float],
+    *,
+    start_epoch: int,
+    target_ratio: float,
+    codec: str,
+    train_codec_source: str,
+    kappa: float,
+    ema_beta: float,
+    minimum_weight: float,
+    maximum_weight: float,
+) -> dict[str, object]:
+    """Create versioned direct-rate dual state that is safe to resume."""
+
+    if not initial_weights or any(weight <= 0 for weight in initial_weights.values()):
+        raise ValueError("direct-rate dual weights must be positive")
+    return {
+        "version": RATE_DUAL_STATE_VERSION,
+        "start_epoch": int(start_epoch),
+        "target_bpp_ratio": float(target_ratio),
+        "codec_qps": list(initial_weights),
+        "codec": str(codec),
+        "train_codec_source": str(train_codec_source),
+        "kappa": float(kappa),
+        "ema_beta": float(ema_beta),
+        "minimum_weight": float(minimum_weight),
+        "maximum_weight": float(maximum_weight),
+        "initial_weight_by_qp": {
+            int(qp): float(weight) for qp, weight in initial_weights.items()
+        },
+        "log_dual_weight_by_qp": {
+            int(qp): math.log(float(weight)) for qp, weight in initial_weights.items()
+        },
+        "ema_ratio_by_qp": {},
+        "last_ratio_by_qp": {},
+    }
+
+
+def validate_rate_dual_resume_state(
+    state: dict[str, object],
+    *,
+    initial_weights: dict[int, float],
+    codec_qps: list[int],
+    target_ratio: float,
+    codec: str,
+    train_codec_source: str,
+    kappa: float,
+    ema_beta: float,
+    minimum_weight: float,
+    maximum_weight: float,
+) -> None:
+    """Reject a resumed direct-rate controller whose semantics changed."""
+
+    if int(state.get("version", -1)) != RATE_DUAL_STATE_VERSION:
+        raise ValueError("resume checkpoint has an incompatible rate-dual state version")
+    if list(state.get("codec_qps", [])) != list(codec_qps):
+        raise ValueError("resume checkpoint rate-dual QPs do not match --codec-qps")
+    if not math.isclose(float(state.get("target_bpp_ratio", math.nan)), target_ratio):
+        raise ValueError("resume target BPP ratio differs from the checkpoint")
+    if state.get("codec") != codec:
+        raise ValueError("resume rate-dual codec differs from the checkpoint")
+    if state.get("train_codec_source") != train_codec_source:
+        raise ValueError("resume train codec source differs from the checkpoint")
+    for name, current in (
+        ("kappa", kappa),
+        ("ema_beta", ema_beta),
+        ("minimum_weight", minimum_weight),
+        ("maximum_weight", maximum_weight),
+    ):
+        if not math.isclose(float(state.get(name, math.nan)), current):
+            raise ValueError(f"resume rate-dual {name} differs from the checkpoint")
+    saved_initial = state.get("initial_weight_by_qp")
+    if not isinstance(saved_initial, dict):
+        raise ValueError("resume checkpoint has no direct-rate initial weights")
+    for qp, current in initial_weights.items():
+        if qp not in saved_initial or not math.isclose(
+            float(saved_initial[qp]), current, rel_tol=1e-9, abs_tol=1e-12
+        ):
+            raise ValueError(
+                "resume direct-rate calibration/parity coefficient differs from "
+                f"the checkpoint at QP {qp}"
+            )
+
+
+def rate_dual_weights(
+    state: dict[str, object], codec_qps: list[int]
+) -> dict[int, float]:
+    log_weights = state["log_dual_weight_by_qp"]
+    if not isinstance(log_weights, dict):
+        raise TypeError("rate-dual log weights must be a mapping")
+    return {qp: math.exp(float(log_weights[qp])) for qp in codec_qps}
+
+
+def update_rate_dual_state(
+    state: dict[str, object],
+    ratios: dict[int, float],
+    *,
+    target_ratio: float,
+    kappa: float,
+    ema_beta: float,
+    minimum_weight: float,
+    maximum_weight: float,
+) -> dict[int, float]:
+    """Apply multiplicative mirror ascent to direct rate multipliers."""
+
+    log_weights = state["log_dual_weight_by_qp"]
+    ema_ratios = state["ema_ratio_by_qp"]
+    if not isinstance(log_weights, dict) or not isinstance(ema_ratios, dict):
+        raise TypeError("rate-dual weights and EMA values must be mappings")
+    minimum_log = math.log(minimum_weight)
+    maximum_log = math.log(maximum_weight)
+    for qp, ratio in ratios.items():
+        previous = ema_ratios.get(qp)
+        ema = (
+            float(ratio)
+            if previous is None
+            else ema_beta * float(previous) + (1.0 - ema_beta) * float(ratio)
+        )
+        ema_ratios[qp] = ema
+        updated = float(log_weights[qp]) + kappa * (ema - target_ratio)
+        log_weights[qp] = min(max(updated, minimum_log), maximum_log)
+    state["last_ratio_by_qp"] = {int(qp): float(value) for qp, value in ratios.items()}
+    return rate_dual_weights(state, list(ratios))
+
+
 class PresetArgumentParser(argparse.ArgumentParser):
     """Parser whose ``@preset`` files allow comments and several tokens per line."""
 
@@ -335,6 +479,11 @@ def parse_args() -> argparse.Namespace:
     data.add_argument("--frame-size", type=int, default=128)
     data.add_argument("--limit-train", type=int)
     data.add_argument("--limit-val", type=int)
+    data.add_argument(
+        "--controller-limit-val",
+        type=int,
+        help="stratified real-codec calibration subset used by direct-rate dual runs",
+    )
     data.add_argument("--workers", type=int, default=4)
 
     model = parser.add_argument_group("model")
@@ -371,6 +520,12 @@ def parse_args() -> argparse.Namespace:
     model.add_argument("--codec-fps", type=float, default=30.0)
     model.add_argument("--codec-preset", default="medium")
     model.add_argument("--ffmpeg", default="ffmpeg")
+    model.add_argument(
+        "--train-codec-source",
+        choices=("real", "proxy"),
+        default="real",
+        help="use exact real-forward/proxy-backward training or fast proxy-only training",
+    )
 
     optimization = parser.add_argument_group("optimization")
     optimization.add_argument("--epochs", type=int, default=30)
@@ -478,6 +633,22 @@ def parse_args() -> argparse.Namespace:
         help="allowed mean-ratio slack; each QP may use twice this slack",
     )
     optimization.add_argument(
+        "--rate-dual-control",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="apply the per-QP dual multiplier directly to anchor-normalized BPP",
+    )
+    optimization.add_argument(
+        "--rate-dual-parity-lambda",
+        type=float,
+        default=0.05,
+        help="legacy raw-BPP lambda whose initial gradient coefficient is reproduced",
+    )
+    optimization.add_argument("--rate-dual-kappa", type=float, default=3.0)
+    optimization.add_argument("--rate-dual-ema-beta", type=float, default=0.8)
+    optimization.add_argument("--rate-dual-min", type=float, default=0.0001)
+    optimization.add_argument("--rate-dual-max", type=float, default=10.0)
+    optimization.add_argument(
         "--normalize-rate-by-anchor",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -530,6 +701,12 @@ def make_loaders(args: argparse.Namespace, categories: list[str]) -> tuple[DataL
     train_dir, val_dir = resolve_data_directories(args)
     train_limit = 8 if args.smoke_test else args.limit_train
     val_limit = 4 if args.smoke_test else args.limit_val
+    if (
+        not args.smoke_test
+        and args.rate_dual_control
+        and args.controller_limit_val is not None
+    ):
+        val_limit = args.controller_limit_val
     dataset_options = {
         "frames": args.frames,
         "stride": args.frame_stride,
@@ -598,15 +775,21 @@ def forward_losses(
     qp: int,
     clean_logits: torch.Tensor | None = None,
     clean_features: dict[str, torch.Tensor] | None = None,
+    *,
+    codec_source: str = "real",
+    report_proxy_rate: bool = False,
 ) -> dict[str, torch.Tensor]:
     device_type = clips.device.type
     feature_weight = float(getattr(args, "feature_weight", 0.0))
     feature_layer = str(getattr(args, "feature_layer", "layer4"))
     with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=use_amp):
         processed = preprocessor(clips, qp)
-        # Forward values come from FFmpeg; the frozen proxy supplies only the
-        # reconstruction/rate Jacobian needed to update the preprocessor.
-        reconstructed, bpp = codec(processed)
+        reconstructed, bpp = codec(processed, codec_source=codec_source)
+        proxy_bpp = bpp
+        if report_proxy_rate and codec_source == "real":
+            # Calibration validation measures drift without paying for another
+            # FFmpeg call. The proxy reconstruction is intentionally discarded.
+            _, proxy_bpp = codec.proxy(processed, qp)
         if feature_weight > 0:
             logits, reconstructed_features = analyzer.forward_with_features(
                 reconstructed, [feature_layer]
@@ -619,7 +802,8 @@ def forward_losses(
     # precision loss without forcing the expensive codec/analyzer convolutions to FP32.
     with torch.autocast(device_type=device_type, enabled=False):
         anchor_bpp = None
-        if bool(getattr(args, "normalize_rate_by_anchor", False)):
+        rate_dual_enabled = bool(getattr(args, "rate_dual_control", False))
+        if bool(getattr(args, "normalize_rate_by_anchor", False)) or rate_dual_enabled:
             anchor_bpp = float(args.qp_to_anchor_bpp[qp])
         (
             rd_loss,
@@ -636,6 +820,11 @@ def forward_losses(
             args.qp_to_rate_lambda[qp],
             float(getattr(args, "distortion_reconstruction_weight", 1.0)),
             anchor_bpp,
+        )
+        rate_ratio = rate if anchor_bpp is None else rate / anchor_bpp
+        proxy_rate = proxy_bpp.float().mean()
+        proxy_rate_ratio = (
+            proxy_rate if anchor_bpp is None else proxy_rate / anchor_bpp
         )
         ce_loss = F.cross_entropy(logits.float(), labels)
         kd_loss = logits.new_zeros((), dtype=torch.float32)
@@ -698,13 +887,28 @@ def forward_losses(
             + kd_weight * kd_loss
             + feature_weight * feature_loss
         )
-        total = rd_loss + accuracy_loss + mask_rate_weight * mask_rate_loss
+        fixed_objective = rd_loss + accuracy_loss + mask_rate_weight * mask_rate_loss
+        rate_dual_loss = logits.new_zeros((), dtype=torch.float32)
+        monitor_loss = fixed_objective
+        if rate_dual_enabled:
+            dual_weight = float(args.qp_to_rate_dual_weight[qp])
+            rate_dual_loss = dual_weight * (
+                rate_ratio - float(args.target_bpp_ratio)
+            )
+            monitor_weight = float(args.qp_to_rate_dual_initial_weight[qp])
+            monitor_loss = fixed_objective + monitor_weight * rate_ratio
+        total = fixed_objective + rate_dual_loss
     return {
         "total": total,
+        "monitor_loss": monitor_loss,
         "distortion": distortion,
         "reconstruction_distortion": reconstruction_distortion,
         "processed_distortion": processed_distortion,
         "rate": rate,
+        "rate_ratio": rate_ratio,
+        "proxy_rate": proxy_rate,
+        "proxy_rate_ratio": proxy_rate_ratio,
+        "rate_dual_loss": rate_dual_loss,
         "accuracy_loss": accuracy_loss,
         "ce_loss": ce_loss,
         "kd_loss": kd_loss,
@@ -732,10 +936,15 @@ def run_epoch(
     analyzer.eval()
     meter_names = (
         "loss",
+        "monitor_loss",
         "distortion",
         "reconstruction_distortion",
         "processed_distortion",
         "bpp",
+        "rate_ratio",
+        "proxy_bpp",
+        "proxy_rate_ratio",
+        "rate_dual_loss",
         "task_loss",
         "ce_loss",
         "kd_loss",
@@ -747,7 +956,17 @@ def run_epoch(
     correct1 = correct5 = examples = 0
     clean_correct1 = clean_correct5 = clean_examples = 0
     per_qp_meters = {
-        qp: {name: AverageMeter() for name in ("loss", "bpp")}
+        qp: {
+            name: AverageMeter()
+            for name in (
+                "loss",
+                "monitor_loss",
+                "bpp",
+                "rate_ratio",
+                "proxy_bpp",
+                "proxy_rate_ratio",
+            )
+        }
         for qp in args.codec_qps
     }
     per_qp_correct = {qp: {"top1": 0, "top5": 0, "examples": 0} for qp in args.codec_qps}
@@ -807,6 +1026,14 @@ def run_epoch(
                     qp,
                     clean_logits,
                     clean_features,
+                    codec_source=(
+                        str(getattr(args, "train_codec_source", "real"))
+                        if training
+                        else "real"
+                    ),
+                    report_proxy_rate=(
+                        not training and bool(getattr(args, "rate_dual_control", False))
+                    ),
                 )
                 if training:
                     scaled_loss = losses["total"] / args.accumulation_steps
@@ -822,10 +1049,15 @@ def run_epoch(
 
                 batch = labels.numel()
                 loss_value = float(losses["total"].detach())
+                monitor_value = float(losses["monitor_loss"].detach())
                 bpp_value = float(losses["rate"].detach())
+                rate_ratio_value = float(losses["rate_ratio"].detach())
+                proxy_bpp_value = float(losses["proxy_rate"].detach())
+                proxy_ratio_value = float(losses["proxy_rate_ratio"].detach())
                 top1 = topk_correct(losses["logits"].detach(), labels, 1)
                 top5 = topk_correct(losses["logits"].detach(), labels, 5)
                 meters["loss"].update(loss_value, batch)
+                meters["monitor_loss"].update(monitor_value, batch)
                 meters["distortion"].update(float(losses["distortion"].detach()), batch)
                 meters["reconstruction_distortion"].update(
                     float(losses["reconstruction_distortion"].detach()), batch
@@ -834,6 +1066,12 @@ def run_epoch(
                     float(losses["processed_distortion"].detach()), batch
                 )
                 meters["bpp"].update(bpp_value, batch)
+                meters["rate_ratio"].update(rate_ratio_value, batch)
+                meters["proxy_bpp"].update(proxy_bpp_value, batch)
+                meters["proxy_rate_ratio"].update(proxy_ratio_value, batch)
+                meters["rate_dual_loss"].update(
+                    float(losses["rate_dual_loss"].detach()), batch
+                )
                 meters["task_loss"].update(float(losses["accuracy_loss"].detach()), batch)
                 meters["ce_loss"].update(float(losses["ce_loss"].detach()), batch)
                 meters["kd_loss"].update(float(losses["kd_loss"].detach()), batch)
@@ -844,7 +1082,13 @@ def run_epoch(
                 examples += batch
                 if not training:
                     per_qp_meters[qp]["loss"].update(loss_value, batch)
+                    per_qp_meters[qp]["monitor_loss"].update(monitor_value, batch)
                     per_qp_meters[qp]["bpp"].update(bpp_value, batch)
+                    per_qp_meters[qp]["rate_ratio"].update(rate_ratio_value, batch)
+                    per_qp_meters[qp]["proxy_bpp"].update(proxy_bpp_value, batch)
+                    per_qp_meters[qp]["proxy_rate_ratio"].update(
+                        proxy_ratio_value, batch
+                    )
                     per_qp_correct[qp]["top1"] += top1
                     per_qp_correct[qp]["top5"] += top5
                     per_qp_correct[qp]["examples"] += batch
@@ -856,10 +1100,15 @@ def run_epoch(
 
     metrics = {
         "loss": meters["loss"].average,
+        "monitor_loss": meters["monitor_loss"].average,
         "distortion": meters["distortion"].average,
         "reconstruction_distortion": meters["reconstruction_distortion"].average,
         "processed_distortion": meters["processed_distortion"].average,
         "bpp": meters["bpp"].average,
+        "rate_ratio": meters["rate_ratio"].average,
+        "proxy_bpp": meters["proxy_bpp"].average,
+        "proxy_rate_ratio": meters["proxy_rate_ratio"].average,
+        "rate_dual_loss": meters["rate_dual_loss"].average,
         "task_loss": meters["task_loss"].average,
         "ce_loss": meters["ce_loss"].average,
         "kd_loss": meters["kd_loss"].average,
@@ -876,7 +1125,17 @@ def run_epoch(
         for qp in args.codec_qps:
             qp_examples = per_qp_correct[qp]["examples"]
             metrics[f"qp{qp}_loss"] = per_qp_meters[qp]["loss"].average
+            metrics[f"qp{qp}_monitor_loss"] = per_qp_meters[qp][
+                "monitor_loss"
+            ].average
             metrics[f"qp{qp}_bpp"] = per_qp_meters[qp]["bpp"].average
+            metrics[f"qp{qp}_rate_ratio"] = per_qp_meters[qp][
+                "rate_ratio"
+            ].average
+            metrics[f"qp{qp}_proxy_bpp"] = per_qp_meters[qp]["proxy_bpp"].average
+            metrics[f"qp{qp}_proxy_rate_ratio"] = per_qp_meters[qp][
+                "proxy_rate_ratio"
+            ].average
             metrics[f"qp{qp}_top1"] = per_qp_correct[qp]["top1"] / max(qp_examples, 1)
             metrics[f"qp{qp}_top5"] = per_qp_correct[qp]["top5"] / max(qp_examples, 1)
     return metrics
@@ -1028,6 +1287,23 @@ def main() -> None:
             raise ValueError("mask-rate bounds must satisfy 0 < min <= max")
         if args.dual_feasibility_tolerance < 0:
             raise ValueError("--dual-feasibility-tolerance must be non-negative")
+    if args.rate_dual_control:
+        if args.dual_rate_control:
+            raise ValueError(
+                "--rate-dual-control and legacy --dual-rate-control are mutually exclusive"
+            )
+        if args.target_bpp_ratio <= 0:
+            raise ValueError("--target-bpp-ratio must be positive")
+        if args.rate_dual_parity_lambda <= 0:
+            raise ValueError("--rate-dual-parity-lambda must be positive")
+        if args.rate_dual_kappa <= 0:
+            raise ValueError("--rate-dual-kappa must be positive")
+        if not 0.0 <= args.rate_dual_ema_beta < 1.0:
+            raise ValueError("--rate-dual-ema-beta must be in [0, 1)")
+        if args.rate_dual_min <= 0 or args.rate_dual_max < args.rate_dual_min:
+            raise ValueError("rate-dual bounds must satisfy 0 < min <= max")
+        if args.controller_limit_val is not None and args.controller_limit_val < 1:
+            raise ValueError("--controller-limit-val must be positive")
     if args.qp_sampling_weights is not None:
         if len(args.qp_sampling_weights) != len(args.codec_qps):
             raise ValueError(
@@ -1038,6 +1314,10 @@ def main() -> None:
         ):
             raise ValueError("--qp-sampling-weights must be non-negative with a positive sum")
     args.qp_to_rate_lambda = build_qp_lambda_map(args.codec_qps, args.rate_lambda)
+    if args.rate_dual_control and any(args.qp_to_rate_lambda.values()):
+        raise ValueError(
+            "direct-rate dual control requires --rate-lambda 0 to avoid counting rate twice"
+        )
     if args.frame_size % 2:
         raise ValueError("--frame-size must be even for yuv420p H.264/H.265")
     require_ffmpeg(args.ffmpeg)
@@ -1063,6 +1343,14 @@ def main() -> None:
             f"ema_beta={args.dual_ema_beta} warmup={args.dual_warmup_epochs} "
             f"bounds=[{args.mask_rate_min}, {args.mask_rate_max}]"
         )
+    if args.rate_dual_control:
+        print(
+            "[setup] direct per-QP rate dual "
+            f"target={args.target_bpp_ratio:.3f} kappa={args.rate_dual_kappa} "
+            f"ema_beta={args.rate_dual_ema_beta} "
+            f"bounds=[{args.rate_dual_min}, {args.rate_dual_max}] "
+            f"train_codec={args.train_codec_source}"
+        )
     if args.qp_sampling_weights is None:
         print(f"[setup] QP sampling: uniform over {args.codec_qps}")
     else:
@@ -1076,9 +1364,14 @@ def main() -> None:
             "[setup] uniform sampling is the v3 default: with four QPs the BD-rate "
             "polynomial interpolates exactly, so a tilt optimizes a fit artifact"
         )
-    if args.limit_val is not None and args.checkpoint_metric == "task_bd_rate":
+    effective_val_limit = (
+        args.controller_limit_val
+        if args.rate_dual_control and args.controller_limit_val is not None
+        else args.limit_val
+    )
+    if effective_val_limit is not None and args.checkpoint_metric == "task_bd_rate":
         print(
-            f"[warn] Task BD-rate is being selected on {args.limit_val} validation "
+            f"[warn] Task BD-rate is being selected on {effective_val_limit} validation "
             "clips. Top-1 on a small subset is optimistic by roughly one point, which "
             "is a few BD points. Rank epochs here, then confirm on the full split."
         )
@@ -1163,6 +1456,23 @@ def main() -> None:
         qp: anchor_metrics[f"qp{qp}_bpp"] for qp in args.codec_qps
     }
     print(f"[setup] validation anchor BPP by QP={args.qp_to_anchor_bpp}")
+    if args.rate_dual_control:
+        args.qp_to_rate_dual_initial_weight = build_rate_dual_initial_weights(
+            args.codec_qps,
+            args.qp_to_anchor_bpp,
+            alpha=args.alpha,
+            parity_lambda=args.rate_dual_parity_lambda,
+        )
+    else:
+        args.qp_to_rate_dual_initial_weight = {
+            qp: 0.0 for qp in args.codec_qps
+        }
+    args.qp_to_rate_dual_weight = dict(args.qp_to_rate_dual_initial_weight)
+    if args.rate_dual_control:
+        print(
+            "[setup] direct-rate initial weights by QP="
+            f"{args.qp_to_rate_dual_initial_weight}"
+        )
     if args.normalize_rate_by_anchor:
         print("[setup] rate normalization by validation anchor BPP is enabled")
     optimizer_class = AdamW if args.optimizer == "adamw" else Adam
@@ -1227,6 +1537,49 @@ def main() -> None:
         qp: float(args.mask_rate_weight) for qp in args.codec_qps
     }
 
+    rate_dual_state: dict[str, object] | None = None
+    if args.rate_dual_control:
+        saved_rate_dual_state = (
+            checkpoint.get("rate_dual_state") if checkpoint else None
+        )
+        if checkpoint is not None and not isinstance(saved_rate_dual_state, dict):
+            raise ValueError(
+                "checkpoint predates direct-rate dual V5 and cannot be resumed; "
+                "start a fresh V5 run"
+            )
+        if isinstance(saved_rate_dual_state, dict):
+            validate_rate_dual_resume_state(
+                saved_rate_dual_state,
+                initial_weights=args.qp_to_rate_dual_initial_weight,
+                codec_qps=args.codec_qps,
+                target_ratio=args.target_bpp_ratio,
+                codec=args.codec,
+                train_codec_source=args.train_codec_source,
+                kappa=args.rate_dual_kappa,
+                ema_beta=args.rate_dual_ema_beta,
+                minimum_weight=args.rate_dual_min,
+                maximum_weight=args.rate_dual_max,
+            )
+            rate_dual_state = saved_rate_dual_state
+            saved_initial_weights = rate_dual_state["initial_weight_by_qp"]
+            assert isinstance(saved_initial_weights, dict)
+            args.qp_to_rate_dual_initial_weight = {
+                qp: float(saved_initial_weights[qp]) for qp in args.codec_qps
+            }
+            print("[resume] restored versioned direct-rate dual state")
+        else:
+            rate_dual_state = initialize_rate_dual_state(
+                args.qp_to_rate_dual_initial_weight,
+                start_epoch=start_epoch,
+                target_ratio=args.target_bpp_ratio,
+                codec=args.codec,
+                train_codec_source=args.train_codec_source,
+                kappa=args.rate_dual_kappa,
+                ema_beta=args.rate_dual_ema_beta,
+                minimum_weight=args.rate_dual_min,
+                maximum_weight=args.rate_dual_max,
+            )
+
     for epoch in range(start_epoch, args.epochs + 1):
         if dual_state is not None:
             args.qp_to_mask_rate_weight = dual_mask_weights(
@@ -1235,11 +1588,16 @@ def main() -> None:
                 epoch,
                 args.dual_warmup_epochs,
             )
+        if rate_dual_state is not None:
+            args.qp_to_rate_dual_weight = rate_dual_weights(
+                rate_dual_state, args.codec_qps
+            )
         qp_rng = random.Random(args.seed + 17 + epoch)
         print(
             f"\n[epoch {epoch}/{args.epochs}] {args.codec.upper()} "
             f"mixed QPs={args.codec_qps} lambdas={args.qp_to_rate_lambda} "
-            f"mask_weights={args.qp_to_mask_rate_weight}"
+            f"mask_weights={args.qp_to_mask_rate_weight} "
+            f"rate_dual_weights={args.qp_to_rate_dual_weight}"
         )
         train_metrics = run_epoch(
             train_loader,
@@ -1260,15 +1618,24 @@ def main() -> None:
         bpp_ratios: dict[int, float] = {}
         mean_bpp_ratio: float | None = None
         feasible = False
-        if dual_state is not None:
+        if dual_state is not None or rate_dual_state is not None:
             bpp_ratios, mean_bpp_ratio = validation_bpp_ratios(
                 anchor_metrics, val_metrics, args.codec_qps
             )
             for qp, ratio in bpp_ratios.items():
                 val_metrics[f"qp{qp}_bpp_ratio"] = ratio
-                val_metrics[f"qp{qp}_mask_rate_weight"] = (
-                    args.qp_to_mask_rate_weight[qp]
-                )
+                if dual_state is not None:
+                    val_metrics[f"qp{qp}_mask_rate_weight"] = (
+                        args.qp_to_mask_rate_weight[qp]
+                    )
+                if rate_dual_state is not None:
+                    val_metrics[f"qp{qp}_rate_dual_weight"] = (
+                        args.qp_to_rate_dual_weight[qp]
+                    )
+                    proxy_ratio = val_metrics[f"qp{qp}_proxy_rate_ratio"]
+                    val_metrics[f"qp{qp}_proxy_drift_percent"] = 100.0 * (
+                        proxy_ratio / ratio - 1.0
+                    )
             val_metrics["mean_bpp_ratio"] = mean_bpp_ratio
             tolerance = args.dual_feasibility_tolerance
             feasible = (
@@ -1278,38 +1645,64 @@ def main() -> None:
             )
             val_metrics["dual_feasible"] = feasible
 
-            local_epoch = epoch - int(dual_state.get("start_epoch", 1)) + 1
-            if local_epoch >= args.dual_warmup_epochs:
-                next_weights = update_dual_rate_state(
-                    dual_state,
+            if rate_dual_state is not None:
+                next_weights = update_rate_dual_state(
+                    rate_dual_state,
                     bpp_ratios,
                     target_ratio=args.target_bpp_ratio,
-                    kappa=args.dual_kappa,
-                    ema_beta=args.dual_ema_beta,
-                    minimum_weight=args.mask_rate_min,
-                    maximum_weight=args.mask_rate_max,
+                    kappa=args.rate_dual_kappa,
+                    ema_beta=args.rate_dual_ema_beta,
+                    minimum_weight=args.rate_dual_min,
+                    maximum_weight=args.rate_dual_max,
+                )
+                weight_map = args.qp_to_rate_dual_weight
+                drift_text = " ".join(
+                    f"QP{qp}:proxy_drift="
+                    f"{val_metrics[f'qp{qp}_proxy_drift_percent']:+.1f}%"
+                    for qp in args.codec_qps
                 )
             else:
-                log_weights = dual_state["log_w_mask_by_qp"]
-                assert isinstance(log_weights, dict)
-                next_weights = {
-                    qp: math.exp(float(log_weights[qp])) for qp in args.codec_qps
-                }
+                assert dual_state is not None
+                local_epoch = epoch - int(dual_state.get("start_epoch", 1)) + 1
+                if local_epoch >= args.dual_warmup_epochs:
+                    next_weights = update_dual_rate_state(
+                        dual_state,
+                        bpp_ratios,
+                        target_ratio=args.target_bpp_ratio,
+                        kappa=args.dual_kappa,
+                        ema_beta=args.dual_ema_beta,
+                        minimum_weight=args.mask_rate_min,
+                        maximum_weight=args.mask_rate_max,
+                    )
+                else:
+                    log_weights = dual_state["log_w_mask_by_qp"]
+                    assert isinstance(log_weights, dict)
+                    next_weights = {
+                        qp: math.exp(float(log_weights[qp])) for qp in args.codec_qps
+                    }
+                weight_map = args.qp_to_mask_rate_weight
+                drift_text = ""
             ratios_text = " ".join(
                 f"QP{qp}:ratio={bpp_ratios[qp]:.3f} "
-                f"w={args.qp_to_mask_rate_weight[qp]:.3f} "
+                f"w={weight_map[qp]:.4f} "
                 f"next={next_weights[qp]:.3f}"
                 for qp in args.codec_qps
             )
             print(
                 f"[dual] {ratios_text} mean={mean_bpp_ratio:.3f} "
-                f"target={args.target_bpp_ratio:.3f} feasible={feasible}"
+                f"target={args.target_bpp_ratio:.3f} feasible={feasible} "
+                f"{drift_text}".rstrip()
             )
-        scheduler.step(val_metrics["loss"])
+        scheduler_metric = (
+            val_metrics["monitor_loss"]
+            if args.rate_dual_control
+            else val_metrics["loss"]
+        )
+        scheduler.step(scheduler_metric)
         print(f"train={train_metrics}")
         print(f"valid={val_metrics}")
 
-        new_best_loss = val_metrics["loss"] < best_loss
+        new_best_loss = scheduler_metric < best_loss
         new_best_ce = val_metrics["ce_loss"] < best_ce
         new_best_top1 = val_metrics["top1"] > best_top1
         new_best_task_bd_rate = (
@@ -1321,7 +1714,7 @@ def main() -> None:
             and task_bd_rate < best_feasible_task_bd_rate
         )
         if new_best_loss:
-            best_loss = val_metrics["loss"]
+            best_loss = scheduler_metric
         if new_best_ce:
             best_ce = val_metrics["ce_loss"]
         if new_best_top1:
@@ -1349,6 +1742,8 @@ def main() -> None:
             "rate_lambdas_by_qp": dict(args.qp_to_rate_lambda),
             "mask_rate_weights_by_qp": dict(args.qp_to_mask_rate_weight),
             "dual_state": dual_state,
+            "rate_dual_weights_by_qp": dict(args.qp_to_rate_dual_weight),
+            "rate_dual_state": rate_dual_state,
             "proxy_checkpoint": str(args.proxy_checkpoint),
             "args": vars(args),
             "train_metrics": train_metrics,
@@ -1389,7 +1784,7 @@ def main() -> None:
         if primary_improved:
             save_checkpoint(output_dir / "best.pt", payload)
             primary_metric_key = {
-                "loss": "loss",
+                "loss": "monitor_loss" if args.rate_dual_control else "loss",
                 "ce": "ce_loss",
                 "top1": "top1",
             }.get(args.checkpoint_metric, "loss")

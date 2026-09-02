@@ -651,8 +651,16 @@ class ParallelStandardVideoCodec(nn.Module):
         return self
 
     def forward(
-        self, clip: torch.Tensor, *, use_proxy_gradient: bool | None = None
+        self,
+        clip: torch.Tensor,
+        *,
+        use_proxy_gradient: bool | None = None,
+        codec_source: str = "real",
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if codec_source == "proxy":
+            return self.proxy(clip, self.qp)
+        if codec_source != "real":
+            raise ValueError("codec_source must be 'real' or 'proxy'")
         real_reconstruction, real_bpp = self.standard_codec(clip.detach())
         if use_proxy_gradient is None:
             use_proxy_gradient = self.training and torch.is_grad_enabled()

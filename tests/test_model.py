@@ -198,6 +198,16 @@ def test_parallel_codec_uses_real_forward_values_and_proxy_backward():
     assert torch.count_nonzero(clip.grad) == clip.numel()
 
 
+def test_parallel_codec_proxy_source_skips_real_forward_values():
+    clip = torch.rand(1, 2, 3, 8, 8, requires_grad=True)
+    codec = ParallelStandardVideoCodec(_FakeStandardCodec(), _FakeProxy()).train()
+    reconstruction, bpp = codec(clip, codec_source="proxy")
+    torch.testing.assert_close(reconstruction, clip * 2.0)
+    torch.testing.assert_close(bpp, clip.mean(dim=(1, 2, 3, 4)))
+    (reconstruction.mean() + bpp.mean()).backward()
+    assert clip.grad is not None
+
+
 def test_frozen_film_deeper3d_proxy_backpropagates_to_preprocessor_input():
     proxy = StandardCodecProxy(
         hidden_channels=8,

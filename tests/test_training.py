@@ -10,18 +10,22 @@ from torch.utils.data import DataLoader, TensorDataset
 from train import (
     PresetArgumentParser,
     analyzer_view_box,
+    build_rate_dual_initial_weights,
     build_qp_lambda_map,
     build_rate_weight,
     clean_feature_layers,
     compression_loss,
     dual_mask_weights,
     initialize_dual_rate_state,
+    initialize_rate_dual_state,
     masked_total_variation,
     parse_args,
     run_epoch,
+    update_rate_dual_state,
     update_dual_rate_state,
     validation_bpp_ratios,
     validation_task_bd_rate,
+    validate_rate_dual_resume_state,
 )
 
 PRESET_DIR = Path(__file__).resolve().parents[1] / "presets"
@@ -119,6 +123,65 @@ def test_validation_bpp_ratios_reports_per_qp_and_ratio_of_means():
     assert mean_ratio == pytest.approx(0.88)
 
 
+def test_rate_dual_initial_weights_reproduce_legacy_raw_bpp_coefficient():
+    anchors = {30: 0.335706, 45: 0.071014}
+    weights = build_rate_dual_initial_weights(
+        [30, 45], anchors, alpha=10.0, parity_lambda=0.05
+    )
+    assert weights[30] / anchors[30] == pytest.approx(0.5)
+    assert weights[45] / anchors[45] == pytest.approx(0.5)
+
+
+def test_versioned_rate_dual_state_updates_and_rejects_target_mismatch():
+    state = initialize_rate_dual_state(
+        {30: 0.1, 45: 0.05},
+        start_epoch=1,
+        target_ratio=0.98,
+        codec="h264",
+        train_codec_source="proxy",
+        kappa=3.0,
+        ema_beta=0.8,
+        minimum_weight=0.0001,
+        maximum_weight=10.0,
+    )
+    validate_rate_dual_resume_state(
+        state,
+        initial_weights={30: 0.1, 45: 0.05},
+        codec_qps=[30, 45],
+        target_ratio=0.98,
+        codec="h264",
+        train_codec_source="proxy",
+        kappa=3.0,
+        ema_beta=0.8,
+        minimum_weight=0.0001,
+        maximum_weight=10.0,
+    )
+    weights = update_rate_dual_state(
+        state,
+        {30: 1.1, 45: 0.9},
+        target_ratio=0.98,
+        kappa=3.0,
+        ema_beta=0.8,
+        minimum_weight=0.0001,
+        maximum_weight=10.0,
+    )
+    assert weights[30] > 0.1
+    assert weights[45] < 0.05
+    with pytest.raises(ValueError, match="target BPP ratio"):
+        validate_rate_dual_resume_state(
+            state,
+            initial_weights={30: 0.1, 45: 0.05},
+            codec_qps=[30, 45],
+            target_ratio=0.95,
+            codec="h264",
+            train_codec_source="proxy",
+            kappa=3.0,
+            ema_beta=0.8,
+            minimum_weight=0.0001,
+            maximum_weight=10.0,
+        )
+
+
 class _RecordingPreprocessor(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -137,7 +200,10 @@ class _ValidationCodec(nn.Module):
     def set_qp(self, qp: int) -> None:
         self.qp = qp
 
-    def forward(self, clips: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, clips: torch.Tensor, *, codec_source: str = "real"
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del codec_source
         bpp = torch.full((clips.shape[0],), self.qp / 100.0, device=clips.device)
         return clips, bpp
 

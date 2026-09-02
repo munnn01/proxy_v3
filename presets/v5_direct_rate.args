@@ -1,0 +1,45 @@
+# V5: fast proxy-only primal optimization with a real-codec calibration loop.
+# The direct per-QP multiplier acts on proxy_bpp / anchor_bpp during training;
+# exact real BPP on a stratified validation subset drives the dual update.
+
+--preprocessor swin
+--swin-qp-conditioning
+--swin-qp-embed-dim 64
+--max-residual 0.25
+
+--codec h264
+--codec-qps 30 35 40 45
+--train-codec-source proxy
+--controller-limit-val 400
+
+--alpha 10
+--rate-lambda 0
+--distortion-reconstruction-weight 1.0
+
+--ce-weight 1.0
+--kd-weight 0.5
+--kd-temperature 2.0
+--feature-weight 0.05
+--feature-layer layer4
+
+# Masked TV remains available as an ablation but is off in the headline run.
+--mask-rate-weight 0
+--mask-rate-target output
+--mask-rate-layer layer4
+--mask-rate-gamma 1.0
+--mask-rate-outside-weight 0.0
+
+--rate-dual-control
+--target-bpp-ratio 0.98
+--rate-dual-parity-lambda 0.05
+--rate-dual-kappa 3.0
+--rate-dual-ema-beta 0.8
+--rate-dual-min 0.0001
+--rate-dual-max 10.0
+--dual-feasibility-tolerance 0.01
+
+--optimizer adamw
+--weight-decay 0.01
+--lr 0.0001
+--clip-grad 1.0
+--checkpoint-metric task_bd_rate
