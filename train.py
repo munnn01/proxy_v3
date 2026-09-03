@@ -308,7 +308,7 @@ def update_dual_rate_state(
     return {qp: math.exp(float(log_weights[qp])) for qp in ratios}
 
 
-RATE_DUAL_STATE_VERSION = 1
+RATE_DUAL_STATE_VERSION = 2
 
 
 def build_rate_dual_initial_weights(
@@ -338,6 +338,8 @@ def initialize_rate_dual_state(
     ema_beta: float,
     minimum_weight: float,
     maximum_weight: float,
+    max_proxy_underestimate_percent: float = 10.0,
+    proxy_guard_patience: int = 1,
 ) -> dict[str, object]:
     """Create versioned direct-rate dual state that is safe to resume."""
 
@@ -354,6 +356,11 @@ def initialize_rate_dual_state(
         "ema_beta": float(ema_beta),
         "minimum_weight": float(minimum_weight),
         "maximum_weight": float(maximum_weight),
+        "max_proxy_underestimate_percent": float(max_proxy_underestimate_percent),
+        "proxy_guard_patience": int(proxy_guard_patience),
+        "proxy_guard_streak": 0,
+        "proxy_guard_bad_qps": [],
+        "last_proxy_drift_percent_by_qp": {},
         "initial_weight_by_qp": {
             int(qp): float(weight) for qp, weight in initial_weights.items()
         },
@@ -377,6 +384,8 @@ def validate_rate_dual_resume_state(
     ema_beta: float,
     minimum_weight: float,
     maximum_weight: float,
+    max_proxy_underestimate_percent: float = 10.0,
+    proxy_guard_patience: int = 1,
 ) -> None:
     """Reject a resumed direct-rate controller whose semantics changed."""
 
@@ -395,6 +404,7 @@ def validate_rate_dual_resume_state(
         ("ema_beta", ema_beta),
         ("minimum_weight", minimum_weight),
         ("maximum_weight", maximum_weight),
+        ("max_proxy_underestimate_percent", max_proxy_underestimate_percent),
     ):
         if not math.isclose(float(state.get(name, math.nan)), current):
             raise ValueError(f"resume rate-dual {name} differs from the checkpoint")
@@ -409,6 +419,10 @@ def validate_rate_dual_resume_state(
                 "resume direct-rate calibration/parity coefficient differs from "
                 f"the checkpoint at QP {qp}"
             )
+    if int(state.get("proxy_guard_patience", -1)) != int(proxy_guard_patience):
+        raise ValueError(
+            "resume rate-dual proxy guard patience differs from the checkpoint"
+        )
 
 
 def rate_dual_weights(
@@ -450,6 +464,72 @@ def update_rate_dual_state(
         log_weights[qp] = min(max(updated, minimum_log), maximum_log)
     state["last_ratio_by_qp"] = {int(qp): float(value) for qp, value in ratios.items()}
     return rate_dual_weights(state, list(ratios))
+
+
+def update_rate_dual_proxy_guard(
+    state: dict[str, object],
+    real_ratio_by_qp: dict[int, float],
+    proxy_drift_percent_by_qp: dict[int, float],
+    *,
+    maximum_allowed_ratio: float,
+    max_underestimate_percent: float,
+    patience: int,
+) -> tuple[list[int], bool]:
+    """Track epochs where the frozen proxy dangerously understates real BPP."""
+
+    if max_underestimate_percent <= 0:
+        raise ValueError("maximum proxy underestimation must be positive")
+    if patience < 1:
+        raise ValueError("rate-dual proxy guard patience must be positive")
+    bad_qps = sorted(
+        int(qp)
+        for qp, drift in proxy_drift_percent_by_qp.items()
+        if float(real_ratio_by_qp[qp]) > float(maximum_allowed_ratio)
+        and float(drift) < -float(max_underestimate_percent)
+    )
+    streak = int(state.get("proxy_guard_streak", 0)) + 1 if bad_qps else 0
+    state["proxy_guard_streak"] = streak
+    state["proxy_guard_bad_qps"] = bad_qps
+    state["last_proxy_drift_percent_by_qp"] = {
+        int(qp): float(drift) for qp, drift in proxy_drift_percent_by_qp.items()
+    }
+    return bad_qps, bool(bad_qps and streak >= patience)
+
+
+def should_save_primary_checkpoint(
+    selected_metric_improved: bool,
+    *,
+    rate_dual_enabled: bool,
+    new_best_feasible: bool,
+) -> bool:
+    """Never expose an infeasible direct-rate checkpoint as ``best.pt``."""
+
+    return new_best_feasible if rate_dual_enabled else selected_metric_improved
+
+
+def require_feasible_rate_dual_result(
+    rate_dual_enabled: bool, best_feasible_task_bd_rate: float
+) -> None:
+    """Fail a completed direct-rate run that never met its codec constraint."""
+
+    if rate_dual_enabled and not math.isfinite(best_feasible_task_bd_rate):
+        raise RuntimeError(
+            "rate-dual training finished without a feasible checkpoint; "
+            "best.pt was intentionally not written. Inspect last.pt proxy drift, "
+            "recalibrate the proxy on preprocessor outputs, and start a fresh run."
+        )
+
+
+def validate_rate_dual_checkpoint_metric(
+    rate_dual_enabled: bool, checkpoint_metric: str
+) -> None:
+    """Keep constrained primary-checkpoint ordering unambiguous."""
+
+    if rate_dual_enabled and checkpoint_metric != "task_bd_rate":
+        raise ValueError(
+            "--rate-dual-control requires --checkpoint-metric task_bd_rate so "
+            "best.pt has unambiguous feasible-selection semantics"
+        )
 
 
 class PresetArgumentParser(argparse.ArgumentParser):
@@ -648,6 +728,18 @@ def parse_args() -> argparse.Namespace:
     optimization.add_argument("--rate-dual-ema-beta", type=float, default=0.8)
     optimization.add_argument("--rate-dual-min", type=float, default=0.0001)
     optimization.add_argument("--rate-dual-max", type=float, default=10.0)
+    optimization.add_argument(
+        "--rate-dual-max-proxy-underestimate-percent",
+        type=float,
+        default=10.0,
+        help="abort when proxy BPP understates real BPP beyond this percentage",
+    )
+    optimization.add_argument(
+        "--rate-dual-proxy-guard-patience",
+        type=int,
+        default=1,
+        help="consecutive unsafe validation epochs allowed before aborting",
+    )
     optimization.add_argument(
         "--normalize-rate-by-anchor",
         action=argparse.BooleanOptionalAction,
@@ -1292,6 +1384,9 @@ def main() -> None:
             raise ValueError(
                 "--rate-dual-control and legacy --dual-rate-control are mutually exclusive"
             )
+        validate_rate_dual_checkpoint_metric(
+            args.rate_dual_control, args.checkpoint_metric
+        )
         if args.target_bpp_ratio <= 0:
             raise ValueError("--target-bpp-ratio must be positive")
         if args.rate_dual_parity_lambda <= 0:
@@ -1302,6 +1397,12 @@ def main() -> None:
             raise ValueError("--rate-dual-ema-beta must be in [0, 1)")
         if args.rate_dual_min <= 0 or args.rate_dual_max < args.rate_dual_min:
             raise ValueError("rate-dual bounds must satisfy 0 < min <= max")
+        if args.rate_dual_max_proxy_underestimate_percent <= 0:
+            raise ValueError(
+                "--rate-dual-max-proxy-underestimate-percent must be positive"
+            )
+        if args.rate_dual_proxy_guard_patience < 1:
+            raise ValueError("--rate-dual-proxy-guard-patience must be positive")
         if args.controller_limit_val is not None and args.controller_limit_val < 1:
             raise ValueError("--controller-limit-val must be positive")
     if args.qp_sampling_weights is not None:
@@ -1559,6 +1660,10 @@ def main() -> None:
                 ema_beta=args.rate_dual_ema_beta,
                 minimum_weight=args.rate_dual_min,
                 maximum_weight=args.rate_dual_max,
+                max_proxy_underestimate_percent=(
+                    args.rate_dual_max_proxy_underestimate_percent
+                ),
+                proxy_guard_patience=args.rate_dual_proxy_guard_patience,
             )
             rate_dual_state = saved_rate_dual_state
             saved_initial_weights = rate_dual_state["initial_weight_by_qp"]
@@ -1578,9 +1683,15 @@ def main() -> None:
                 ema_beta=args.rate_dual_ema_beta,
                 minimum_weight=args.rate_dual_min,
                 maximum_weight=args.rate_dual_max,
+                max_proxy_underestimate_percent=(
+                    args.rate_dual_max_proxy_underestimate_percent
+                ),
+                proxy_guard_patience=args.rate_dual_proxy_guard_patience,
             )
 
     for epoch in range(start_epoch, args.epochs + 1):
+        proxy_guard_abort = False
+        proxy_guard_bad_qps: list[int] = []
         if dual_state is not None:
             args.qp_to_mask_rate_weight = dual_mask_weights(
                 dual_state,
@@ -1646,21 +1757,54 @@ def main() -> None:
             val_metrics["dual_feasible"] = feasible
 
             if rate_dual_state is not None:
-                next_weights = update_rate_dual_state(
+                proxy_drifts = {
+                    qp: float(val_metrics[f"qp{qp}_proxy_drift_percent"])
+                    for qp in args.codec_qps
+                }
+                proxy_guard_bad_qps, proxy_guard_abort = update_rate_dual_proxy_guard(
                     rate_dual_state,
                     bpp_ratios,
-                    target_ratio=args.target_bpp_ratio,
-                    kappa=args.rate_dual_kappa,
-                    ema_beta=args.rate_dual_ema_beta,
-                    minimum_weight=args.rate_dual_min,
-                    maximum_weight=args.rate_dual_max,
+                    proxy_drifts,
+                    maximum_allowed_ratio=(
+                        args.target_bpp_ratio + 2.0 * args.dual_feasibility_tolerance
+                    ),
+                    max_underestimate_percent=(
+                        args.rate_dual_max_proxy_underestimate_percent
+                    ),
+                    patience=args.rate_dual_proxy_guard_patience,
                 )
+                val_metrics["rate_dual_proxy_guard_bad_qps"] = proxy_guard_bad_qps
+                val_metrics["rate_dual_proxy_guard_streak"] = int(
+                    rate_dual_state["proxy_guard_streak"]
+                )
+                val_metrics["rate_dual_proxy_guard_abort"] = proxy_guard_abort
+                if proxy_guard_bad_qps:
+                    rate_dual_state["last_ratio_by_qp"] = {
+                        int(qp): float(value) for qp, value in bpp_ratios.items()
+                    }
+                    next_weights = rate_dual_weights(rate_dual_state, args.codec_qps)
+                else:
+                    next_weights = update_rate_dual_state(
+                        rate_dual_state,
+                        bpp_ratios,
+                        target_ratio=args.target_bpp_ratio,
+                        kappa=args.rate_dual_kappa,
+                        ema_beta=args.rate_dual_ema_beta,
+                        minimum_weight=args.rate_dual_min,
+                        maximum_weight=args.rate_dual_max,
+                    )
                 weight_map = args.qp_to_rate_dual_weight
                 drift_text = " ".join(
                     f"QP{qp}:proxy_drift="
                     f"{val_metrics[f'qp{qp}_proxy_drift_percent']:+.1f}%"
                     for qp in args.codec_qps
                 )
+                if proxy_guard_bad_qps:
+                    drift_text += (
+                        " proxy_guard=freeze"
+                        f" bad_qps={proxy_guard_bad_qps}"
+                        f" streak={rate_dual_state['proxy_guard_streak']}"
+                    )
             else:
                 assert dual_state is not None
                 local_epoch = epoch - int(dual_state.get("start_epoch", 1)) + 1
@@ -1748,6 +1892,15 @@ def main() -> None:
             "args": vars(args),
             "train_metrics": train_metrics,
             "val_metrics": val_metrics,
+            "run_status": (
+                "proxy_guard_failed"
+                if proxy_guard_abort
+                else (
+                    "has_feasible_checkpoint"
+                    if math.isfinite(best_feasible_task_bd_rate)
+                    else "infeasible"
+                )
+            ),
         }
         save_checkpoint(output_dir / "last.pt", payload)
         if new_best_feasible:
@@ -1773,9 +1926,14 @@ def main() -> None:
             if improved:
                 save_checkpoint(output_dir / metric_filenames[metric], payload)
 
-        primary_improved = metric_updates[args.checkpoint_metric]
+        primary_improved = should_save_primary_checkpoint(
+            metric_updates[args.checkpoint_metric],
+            rate_dual_enabled=args.rate_dual_control,
+            new_best_feasible=new_best_feasible,
+        )
         if (
-            args.checkpoint_metric == "task_bd_rate"
+            not args.rate_dual_control
+            and args.checkpoint_metric == "task_bd_rate"
             and task_bd_rate is None
             and not (output_dir / "best.pt").exists()
         ):
@@ -1796,6 +1954,17 @@ def main() -> None:
             print(
                 f"[checkpoint] new best {args.checkpoint_metric}: {primary_value}"
             )
+        if proxy_guard_abort:
+            raise RuntimeError(
+                "rate-dual proxy guard aborted training after frozen proxy BPP "
+                "underestimated real BPP by more than "
+                f"{args.rate_dual_max_proxy_underestimate_percent:.1f}% at "
+                f"QPs {proxy_guard_bad_qps}; last.pt contains the diagnostic state"
+            )
+
+    require_feasible_rate_dual_result(
+        args.rate_dual_control, best_feasible_task_bd_rate
+    )
 
 
 if __name__ == "__main__":

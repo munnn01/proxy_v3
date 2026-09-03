@@ -36,6 +36,9 @@
 --rate-dual-ema-beta 0.8
 --rate-dual-min 0.0001
 --rate-dual-max 10.0
+# Stop immediately when the frozen proxy becomes an unsafe rate actuator.
+--rate-dual-max-proxy-underestimate-percent 10.0
+--rate-dual-proxy-guard-patience 1
 --dual-feasibility-tolerance 0.01
 
 --optimizer adamw

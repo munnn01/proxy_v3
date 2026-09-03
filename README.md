@@ -137,6 +137,20 @@ Resume checkpoints include a versioned controller state and reject changes to QP
 codec, target, proxy/real training source, controller hyperparameters, or calibrated
 initial weights. A V4 checkpoint therefore cannot be resumed as V5.
 
+The direct-rate path treats frozen-proxy calibration as a safety condition, not an
+assumption. Validation compares proxy BPP with real-codec BPP at every QP. If an
+infeasible QP exceeds its allowed real-BPP ratio while the proxy understates it by
+more than `--rate-dual-max-proxy-underestimate-percent` (10% by default), multiplier updates
+freeze and the run aborts after `--rate-dual-proxy-guard-patience` consecutive unsafe
+epochs. `last.pt` is saved with the drift diagnostics before aborting. This prevents
+the dual loop from amplifying proxy-specific artifacts while real bitrate rises.
+
+For direct-rate runs, `best.pt` is written only when the checkpoint is feasible and
+is identical to the best feasible Task-BD checkpoint. Raw metric winners remain
+available as diagnostic files such as `best_task_bd_rate.pt`. A run that finishes
+without any feasible checkpoint exits with an error instead of presenting an
+infeasible model as its primary result.
+
 ### The masked rate penalty
 
 Every measured run so far *increased* bitrate: the preprocessor learned to be an
@@ -319,9 +333,10 @@ python -u train.py @presets/v3_masked_rate.args \
   --output-dir checkpoints/preprocessor
 ```
 
-For the recommended V5 experiment, start a fresh output directory and replace the
-preset. Training batches then avoid FFmpeg; the 400-clip real-codec controller pass
-still runs at every epoch:
+For the guarded V5 diagnostic experiment, start a fresh output directory and replace
+the preset. Do not treat this path as a result-producing run until the frozen proxy is
+recalibrated on preprocessor outputs and passes the drift guard. Training batches avoid
+FFmpeg; the 400-clip real-codec controller pass still runs at every epoch:
 
 ```bash
 python -u train.py @presets/v5_direct_rate.args \

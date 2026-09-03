@@ -20,11 +20,15 @@ from train import (
     initialize_rate_dual_state,
     masked_total_variation,
     parse_args,
+    require_feasible_rate_dual_result,
     run_epoch,
+    should_save_primary_checkpoint,
     update_rate_dual_state,
+    update_rate_dual_proxy_guard,
     update_dual_rate_state,
     validation_bpp_ratios,
     validation_task_bd_rate,
+    validate_rate_dual_checkpoint_metric,
     validate_rate_dual_resume_state,
 )
 
@@ -180,6 +184,120 @@ def test_versioned_rate_dual_state_updates_and_rejects_target_mismatch():
             minimum_weight=0.0001,
             maximum_weight=10.0,
         )
+    with pytest.raises(ValueError, match="max_proxy_underestimate_percent"):
+        validate_rate_dual_resume_state(
+            state,
+            initial_weights={30: 0.1, 45: 0.05},
+            codec_qps=[30, 45],
+            target_ratio=0.98,
+            codec="h264",
+            train_codec_source="proxy",
+            kappa=3.0,
+            ema_beta=0.8,
+            minimum_weight=0.0001,
+            maximum_weight=10.0,
+            max_proxy_underestimate_percent=5.0,
+        )
+
+
+def test_rate_dual_proxy_guard_aborts_after_consecutive_underestimation():
+    state = initialize_rate_dual_state(
+        {30: 0.1, 45: 0.05},
+        start_epoch=1,
+        target_ratio=0.98,
+        codec="h264",
+        train_codec_source="proxy",
+        kappa=3.0,
+        ema_beta=0.8,
+        minimum_weight=0.0001,
+        maximum_weight=10.0,
+        max_proxy_underestimate_percent=10.0,
+        proxy_guard_patience=2,
+    )
+    bad_qps, abort = update_rate_dual_proxy_guard(
+        state,
+        {30: 1.1, 45: 1.1},
+        {30: -12.0, 45: -2.0},
+        maximum_allowed_ratio=1.0,
+        max_underestimate_percent=10.0,
+        patience=2,
+    )
+    assert bad_qps == [30]
+    assert not abort
+    assert state["proxy_guard_streak"] == 1
+
+    bad_qps, abort = update_rate_dual_proxy_guard(
+        state,
+        {30: 1.1, 45: 1.1},
+        {30: -15.0, 45: -11.0},
+        maximum_allowed_ratio=1.0,
+        max_underestimate_percent=10.0,
+        patience=2,
+    )
+    assert bad_qps == [30, 45]
+    assert abort
+    assert state["proxy_guard_streak"] == 2
+
+
+def test_rate_dual_proxy_guard_resets_after_safe_epoch():
+    state = {"proxy_guard_streak": 3}
+    bad_qps, abort = update_rate_dual_proxy_guard(
+        state,
+        {30: 0.9},
+        {30: -9.9},
+        maximum_allowed_ratio=1.0,
+        max_underestimate_percent=10.0,
+        patience=1,
+    )
+    assert bad_qps == []
+    assert not abort
+    assert state["proxy_guard_streak"] == 0
+
+
+def test_rate_dual_proxy_guard_allows_underestimation_when_real_rate_is_feasible():
+    state = {"proxy_guard_streak": 0}
+    bad_qps, abort = update_rate_dual_proxy_guard(
+        state,
+        {30: 0.95},
+        {30: -20.0},
+        maximum_allowed_ratio=1.0,
+        max_underestimate_percent=10.0,
+        patience=1,
+    )
+    assert bad_qps == []
+    assert not abort
+
+
+def test_rate_dual_primary_checkpoint_requires_feasibility():
+    assert not should_save_primary_checkpoint(
+        True,
+        rate_dual_enabled=True,
+        new_best_feasible=False,
+    )
+    assert should_save_primary_checkpoint(
+        False,
+        rate_dual_enabled=True,
+        new_best_feasible=True,
+    )
+    assert should_save_primary_checkpoint(
+        True,
+        rate_dual_enabled=False,
+        new_best_feasible=False,
+    )
+
+
+def test_rate_dual_completion_rejects_missing_feasible_checkpoint():
+    with pytest.raises(RuntimeError, match="without a feasible checkpoint"):
+        require_feasible_rate_dual_result(True, float("inf"))
+    require_feasible_rate_dual_result(True, -1.0)
+    require_feasible_rate_dual_result(False, float("inf"))
+
+
+def test_rate_dual_rejects_non_task_primary_metric():
+    with pytest.raises(ValueError, match="requires --checkpoint-metric task_bd_rate"):
+        validate_rate_dual_checkpoint_metric(True, "top1")
+    validate_rate_dual_checkpoint_metric(True, "task_bd_rate")
+    validate_rate_dual_checkpoint_metric(False, "top1")
 
 
 class _RecordingPreprocessor(nn.Module):
