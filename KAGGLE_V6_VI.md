@@ -6,10 +6,10 @@ Pipeline suy luận giữ nguyên: video → Swin Lite → H.264/H.265 thật �
 
 ## Chạy trên Kaggle
 
-1. Gắn bản code mới `proxy_v3_v6_source.zip` vào Kaggle Input, bật GPU và Internet. Clone GitHub cũ sẽ không có các thay đổi chưa được push này.
-2. Giữ lại split `/kaggle/working/v5_fixed_split/{train,controller,validation_full}` đã dựng bằng `kaggle_cells/fixed_split_after_cleaning.ipynb`. Nếu sang session mới, dựng lại bằng notebook đó trên bản video sạch. Không tự chia lại tập dữ liệu để so với run cũ.
-3. Chạy lần lượt sáu cell trong `kaggle_cells/v6_accuracy_rate.ipynb`, hoặc sao chép các cell `# %%` trong file Python cùng tên. Sửa `SPLIT_ROOT` nếu split ở vị trí khác.
-4. `TARGETS=[0.90]` chạy một cấu hình. Có thể dùng `[0.95,0.90,0.85]` cho ba run độc lập, cùng checkpoint khởi tạo. Đặt `RUN_ROOT` mới cho mỗi nhóm thí nghiệm.
+1. Import `kaggle_cells/v6_accuracy_rate.ipynb` từ GitHub vào Kaggle, gắn dataset sạch, bật GPU và Internet, rồi chọn **Run All**. Cell 1 tự clone repo hoặc cập nhật bản đã clone bằng `git pull --ff-only`, sau đó cài dependencies.
+2. Cell 2 đã đặt `DATA=/kaggle/input/datasets/qktttttttttt/kineticscleaned/cleaned_final/kinetics400_5per/kinetics400_5per/train`. Notebook tự chia khoảng 80% train / 20% validation theo từng lớp với `SEED=42`, rồi tạo symlink vào thư mục chạy. Mặc định dùng tối đa 2.000 video train và 400 video validation cho controller, lấy mẫu cân bằng giữa các lớp. Đặt `TRAIN_LIMIT=None` để dùng toàn bộ phần train. Toàn bộ phần validation được giữ cho cell đánh giá cuối.
+3. Sáu cell chạy liên tiếp; không cần ZIP source hay chạy notebook chia split riêng. Mỗi lần chạy cell 2 sẽ tạo `RUN_ROOT` mới theo thời gian, trong `/kaggle/working`. Với cùng dataset, seed và giới hạn mẫu, các tập con giữ nguyên giữa các lần chạy.
+4. `TARGETS=[0.90]` chạy một cấu hình. Có thể dùng `[0.95,0.90,0.85]` cho ba run độc lập, cùng checkpoint khởi tạo. Các tham số số epoch và giới hạn mẫu nằm trong cell 2.
 
 Cell 3 tạo cache từ đúng train/controller rồi học proxy log-BPP. Cell 4 tạo đầu ra Swin và hiệu chỉnh proxy bằng cặp clip gốc / clip đã xử lý, với H.264 thật cung cấp target cho từng biến thể. Cường độ 0 trong `--pair-strengths` đưa đầu ra Swin nguyên trạng vào dữ liệu hiệu chỉnh. Các cường độ khác chỉ làm mịn không gian, không trộn frame.
 

@@ -1,55 +1,64 @@
-# %% Cell 1: Load the UPDATED source archive attached as a Kaggle Input.
+# %% Cell 1: Clone/update the GitHub source and install dependencies.
 from pathlib import Path
-import hashlib
+from datetime import datetime
 import json
+import os
 import subprocess
 import sys
-import zipfile
 
-archives = list(Path("/kaggle/input").rglob("proxy_v3_v6_source.zip"))
-if archives:
-    assert len(archives) == 1, "Select one version of proxy_v3_v6_source.zip."
-    with zipfile.ZipFile(archives[0]) as archive:
-        manifest = json.loads(archive.read("SOURCE_MANIFEST.json"))
-        source_files = {name: archive.read(name) for name in manifest}
-else:
-    manifests = [path for path in Path("/kaggle/input").rglob("SOURCE_MANIFEST.json")
-                 if (path.parent / "presets/v6_accuracy_rate.args").is_file()]
-    assert len(manifests) == 1, "Attach the source ZIP or its extracted files as a Kaggle Input."
-    manifest = json.loads(manifests[0].read_text())
-    source_files = {name: (manifests[0].parent / name).read_bytes() for name in manifest}
-PROJECT = Path("/kaggle/working/proxy_v3_v6")
-source_digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
-marker = PROJECT / ".source_sha256"
+PROJECT = Path("/kaggle/working/proxy_v3")
 if PROJECT.exists():
-    assert marker.is_file() and marker.read_text() == source_digest, "Use a new PROJECT directory for different source."
+    subprocess.run(["git", "-C", str(PROJECT), "pull", "--ff-only", "origin", "main"], check=True)
 else:
-    PROJECT.mkdir(parents=True)
-    for name, data in source_files.items():
-        assert hashlib.sha256(data).hexdigest() == manifest[name], f"Source checksum mismatch: {name}"
-        destination = PROJECT / name
-        assert destination.resolve().is_relative_to(PROJECT.resolve())
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(data)
-    marker.write_text(source_digest)
-assert (PROJECT / "presets/v6_accuracy_rate.args").is_file()
+    subprocess.run(["git", "clone", "-q", "--branch", "main",
+                    "https://github.com/munnn01/proxy_v3.git", str(PROJECT)], check=True)
+os.chdir(PROJECT)
+sys.path.insert(0, str(PROJECT))
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r",
                 str(PROJECT / "requirements.txt")], check=True)
 
-# %% Cell 2: Reuse the fixed, cleaned split; never silently resplit old experiments.
+# %% Cell 2: Automatically split the cleaned dataset and configure this run.
 import torch
+from torchvision.models.video import R3D_18_Weights
+from preprocessing.data import (
+    VideoFolderDataset,
+    stratified_limit_indices,
+    stratified_split_indices,
+)
 
-SPLIT_ROOT = Path("/kaggle/working/v5_fixed_split")
+DATA = Path("/kaggle/input/datasets/qktttttttttt/kineticscleaned/cleaned_final/kinetics400_5per/kinetics400_5per/train")
+SEED = 42
+VAL_RATIO = 0.2
+TRAIN_LIMIT = 2000  # Set to None to use the complete training pool.
+CONTROLLER_LIMIT = 400
+RUN_NAME = "v6_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+RUN_ROOT = Path("/kaggle/working") / RUN_NAME
+SPLIT_ROOT = RUN_ROOT / "split"
 TRAIN_DIR = SPLIT_ROOT / "train"
 VAL_DIR = SPLIT_ROOT / "controller"
 FULL_VAL_DIR = SPLIT_ROOT / "validation_full"
 TEST_DIR = None  # Optional separate, untouched class-folder test directory.
-for folder in (TRAIN_DIR, VAL_DIR, FULL_VAL_DIR):
-    assert folder.is_dir(), f"Missing {folder}. Run fixed_split_after_cleaning.ipynb first."
-assert torch.cuda.is_available(), "Enable a Kaggle GPU."
-subprocess.run(["ffmpeg", "-version"], check=True, stdout=subprocess.DEVNULL)
 
-RUN_ROOT = Path("/kaggle/working/v6_task_rate")
+categories = R3D_18_Weights.DEFAULT.meta["categories"]
+source = VideoFolderDataset(DATA, categories, train=False)
+train_pool, val_ids = stratified_split_indices(source.samples, VAL_RATIO, SEED)
+train_ids = stratified_limit_indices(source.samples, train_pool, TRAIN_LIMIT, SEED + 101)
+controller_ids = stratified_limit_indices(source.samples, val_ids, CONTROLLER_LIMIT, SEED + 202)
+
+def link_split(indices, destination_root):
+    destination_root.mkdir(parents=True, exist_ok=True)
+    for index in indices:
+        source_path, _ = source.samples[index]
+        destination = destination_root / source_path.relative_to(DATA)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.symlink_to(source_path.resolve())
+
+link_split(train_ids, TRAIN_DIR)
+link_split(controller_ids, VAL_DIR)
+link_split(val_ids, FULL_VAL_DIR)
+print({"train": len(train_ids), "controller": len(controller_ids),
+       "validation_full": len(val_ids), "run_root": str(RUN_ROOT)})
+
 CACHE = RUN_ROOT / "cache"
 BASE = RUN_ROOT / "proxy_base"
 WARM = RUN_ROOT / "swin_warmup"
@@ -59,7 +68,7 @@ PROXY_EPOCHS, WARMUP_EPOCHS, CALIBRATION_EPOCHS, TRAIN_EPOCHS = 20, 5, 3, 15
 MAX_TOP1_DROP_PP = 0.0
 
 VIDEO = ["--frames", 16, "--frame-stride", 2, "--frame-size", 128]
-SPLIT = ["--train-dir", TRAIN_DIR, "--val-dir", VAL_DIR, "--seed", 42, "--val-ratio", 0.2]
+SPLIT = ["--train-dir", TRAIN_DIR, "--val-dir", VAL_DIR, "--seed", SEED, "--val-ratio", VAL_RATIO]
 
 def run(script, *arguments, check=True):
     command = [sys.executable, "-u", str(PROJECT / script), *map(str, arguments)]
