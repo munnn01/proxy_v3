@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -37,6 +38,7 @@ from preprocessing.utils import (
     seed_everything,
     topk_correct,
     write_json,
+    validate_run_directory,
 )
 
 
@@ -149,7 +151,11 @@ def build_rate_weight(
     return weight.permute(0, 2, 1, 3, 4)
 
 
-def masked_total_variation(target: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def masked_total_variation(
+    target: torch.Tensor, weight: torch.Tensor, *,
+    temporal_weight: float = 1.0,
+    temporal_target: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Return the weighted mean absolute spatio-temporal gradient of ``target``.
 
     H.264 spends bits on spatial and temporal detail, so this is a differentiable
@@ -160,6 +166,11 @@ def masked_total_variation(target: torch.Tensor, weight: torch.Tensor) -> torch.
 
     if target.ndim != 5 or weight.ndim != 5:
         raise ValueError("masked_total_variation expects [B,T,C,H,W] tensors")
+    if temporal_weight < 0 or not math.isfinite(temporal_weight):
+        raise ValueError("temporal_weight must be finite and non-negative")
+    temporal = target if temporal_target is None else temporal_target
+    if temporal.shape != target.shape:
+        raise ValueError("temporal_target must have the same shape as target")
     total = target.new_zeros(())
     counted = target.new_zeros(())
     differences = (
@@ -172,8 +183,8 @@ def masked_total_variation(target: torch.Tensor, weight: torch.Tensor) -> torch.
             torch.minimum(weight[..., 1:, :], weight[..., :-1, :]),
         ),
         (
-            target[:, 1:] - target[:, :-1],
-            torch.minimum(weight[:, 1:], weight[:, :-1]),
+            temporal[:, 1:] - temporal[:, :-1],
+            temporal_weight * torch.minimum(weight[:, 1:], weight[:, :-1]),
         ),
     )
     for difference, pair_weight in differences:
@@ -182,6 +193,21 @@ def masked_total_variation(target: torch.Tensor, weight: torch.Tensor) -> torch.
         total = total + (pair_weight * difference.abs()).sum()
         counted = counted + pair_weight.expand_as(difference).sum()
     return total / counted.clamp_min(1e-6)
+
+
+def validation_accuracy_guard(
+    anchor: dict[str, float], proposed: dict[str, float], qps: list[int],
+    max_drop_pp: float | None,
+) -> tuple[bool, dict[int, float]]:
+    """Check per-QP Top-1 drops in percentage points, on the same real-codec split."""
+    if max_drop_pp is None:
+        return True, {}
+    if not math.isfinite(max_drop_pp) or max_drop_pp < 0:
+        raise ValueError("max_top1_drop_pp must be finite and non-negative")
+    drops = {qp: 100.0 * (anchor[f"qp{qp}_top1"] - proposed[f"qp{qp}_top1"])
+             for qp in qps}
+    return all(math.isfinite(drop) and drop <= max_drop_pp + 1e-9
+               for drop in drops.values()), drops
 
 
 def clean_feature_layers(args: argparse.Namespace) -> list[str]:
@@ -586,6 +612,10 @@ def parse_args() -> argparse.Namespace:
         help="condition Video Swin features and residual strength on codec QP",
     )
     model.add_argument("--swin-qp-embed-dim", type=int, default=64)
+    model.add_argument("--swin-gated-smoothing", action=argparse.BooleanOptionalAction,
+                       default=False)
+    model.add_argument("--swin-smoothing-max-strength", type=float, default=0.5)
+    model.add_argument("--init-checkpoint", help="initialize preprocessor weights only; new run")
     model.add_argument("--max-residual", type=float, default=0.25)
     model.add_argument("--analyzer", default="r3d_18")
     model.add_argument(
@@ -627,6 +657,13 @@ def parse_args() -> argparse.Namespace:
         help="eta in eta*MSE(reconstruction, source)+(1-eta)*MSE(processed, source)",
     )
     optimization.add_argument("--ce-weight", type=float, default=1.0)
+    optimization.add_argument(
+        "--max-top1-drop-pp", type=float,
+        help="require every real-codec QP to retain anchor Top-1 within this many percentage points",
+    )
+    optimization.add_argument("--mask-rate-temporal-weight", type=float, default=1.0)
+    optimization.add_argument("--mask-rate-temporal-target", choices=("same", "output", "residual"),
+                             default="same", help="same preserves the spatial target used by legacy runs")
     optimization.add_argument(
         "--kd-weight",
         type=float,
@@ -972,7 +1009,17 @@ def forward_losses(
             target = processed.float()
             if str(getattr(args, "mask_rate_target", "output")) == "residual":
                 target = target - clips.float()
-            mask_rate_loss = masked_total_variation(target, rate_weight)
+            temporal_mode = getattr(args, "mask_rate_temporal_target", "same")
+            temporal_target = target
+            if temporal_mode == "residual":
+                temporal_target = processed.float() - clips.float()
+            elif temporal_mode == "output":
+                temporal_target = processed.float()
+            mask_rate_loss = masked_total_variation(
+                target, rate_weight,
+                temporal_weight=float(getattr(args, "mask_rate_temporal_weight", 1.0)),
+                temporal_target=temporal_target,
+            )
 
         accuracy_loss = (
             float(getattr(args, "ce_weight", 1.0)) * ce_loss
@@ -1340,6 +1387,19 @@ def validation_task_bd_rate(
 
 def main() -> None:
     args = parse_args()
+    validate_run_directory(args.output_dir, args.resume)
+    if args.init_checkpoint and args.resume:
+        raise ValueError("choose --init-checkpoint for a new run or --resume for continuation")
+    if args.max_top1_drop_pp is not None:
+        if not math.isfinite(args.max_top1_drop_pp) or args.max_top1_drop_pp < 0:
+            raise ValueError("--max-top1-drop-pp must be finite and non-negative")
+        if args.checkpoint_metric != "task_bd_rate":
+            raise ValueError("accuracy guard requires --checkpoint-metric task_bd_rate")
+    if args.mask_rate_temporal_weight < 0 or not math.isfinite(args.mask_rate_temporal_weight):
+        raise ValueError("--mask-rate-temporal-weight must be finite and non-negative")
+    if args.swin_gated_smoothing and args.preprocessor != "swin":
+        raise ValueError("--swin-gated-smoothing requires --preprocessor swin")
+    guarded_selection = args.rate_dual_control or args.max_top1_drop_pp is not None
     if args.smoke_test:
         args.epochs = 1
     seed_everything(args.seed)
@@ -1504,8 +1564,19 @@ def main() -> None:
         ),
         swin_qp_conditioning=args.swin_qp_conditioning,
         swin_qp_embed_dim=args.swin_qp_embed_dim,
+        swin_gated_smoothing=args.swin_gated_smoothing,
+        swin_smoothing_max_strength=args.swin_smoothing_max_strength,
         max_residual=args.max_residual,
     ).to(device)
+    if args.init_checkpoint:
+        initial = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
+        # A newly enabled smoothing branch starts at zero, preserving the old output.
+        incompatible = preprocessor.load_state_dict(initial["preprocessor"], strict=False)
+        allowed = {"smoothing_head.weight", "smoothing_head.bias"} if args.swin_gated_smoothing else set()
+        if incompatible.unexpected_keys or set(incompatible.missing_keys) - allowed:
+            raise ValueError(f"incompatible preprocessor initialization: {incompatible}")
+        print(f"[init] preprocessor weights from {args.init_checkpoint}; optimizer/controller reset")
+    proxy_sha256 = hashlib.sha256(Path(args.proxy_checkpoint).read_bytes()).hexdigest()
     proxy_checkpoint = torch.load(
         args.proxy_checkpoint, map_location="cpu", weights_only=False
     )
@@ -1593,6 +1664,19 @@ def main() -> None:
     checkpoint: dict[str, object] | None = None
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+        old_args = checkpoint.get("args", {})
+        if checkpoint.get("proxy_sha256", proxy_sha256) != proxy_sha256:
+            raise ValueError("resume changed frozen proxy weights; use --init-checkpoint in a new run")
+        if old_args.get("proxy_checkpoint", args.proxy_checkpoint) != args.proxy_checkpoint:
+            raise ValueError("resume changed --proxy-checkpoint; use --init-checkpoint in a new run")
+        for name, default in (("max_top1_drop_pp", None),
+                              ("mask_rate_temporal_weight", 1.0),
+                              ("mask_rate_temporal_target", "same"),
+                              ("swin_gated_smoothing", False),
+                              ("swin_smoothing_max_strength", 0.5),
+                              ("max_residual", 0.25)):
+            if old_args.get(name, default) != getattr(args, name):
+                raise ValueError(f"resume changed {name}; use --init-checkpoint in a new output directory")
         preprocessor.load_state_dict(checkpoint["preprocessor"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         if "scheduler" in checkpoint:
@@ -1728,7 +1812,14 @@ def main() -> None:
         val_metrics["task_bd_rate_percent"] = task_bd_rate
         bpp_ratios: dict[int, float] = {}
         mean_bpp_ratio: float | None = None
-        feasible = False
+        accuracy_feasible, accuracy_drops = validation_accuracy_guard(
+            anchor_metrics, val_metrics, args.codec_qps, args.max_top1_drop_pp
+        )
+        feasible = accuracy_feasible if args.max_top1_drop_pp is not None else False
+        if args.max_top1_drop_pp is not None:
+            val_metrics["accuracy_feasible"] = accuracy_feasible
+            for qp, drop in accuracy_drops.items():
+                val_metrics[f"qp{qp}_top1_drop_pp"] = drop
         if dual_state is not None or rate_dual_state is not None:
             bpp_ratios, mean_bpp_ratio = validation_bpp_ratios(
                 anchor_metrics, val_metrics, args.codec_qps
@@ -1750,7 +1841,8 @@ def main() -> None:
             val_metrics["mean_bpp_ratio"] = mean_bpp_ratio
             tolerance = args.dual_feasibility_tolerance
             feasible = (
-                mean_bpp_ratio <= args.target_bpp_ratio + tolerance
+                accuracy_feasible
+                and mean_bpp_ratio <= args.target_bpp_ratio + tolerance
                 and max(bpp_ratios.values())
                 <= args.target_bpp_ratio + 2.0 * tolerance
             )
@@ -1889,6 +1981,7 @@ def main() -> None:
             "rate_dual_weights_by_qp": dict(args.qp_to_rate_dual_weight),
             "rate_dual_state": rate_dual_state,
             "proxy_checkpoint": str(args.proxy_checkpoint),
+            "proxy_sha256": proxy_sha256,
             "args": vars(args),
             "train_metrics": train_metrics,
             "val_metrics": val_metrics,
@@ -1908,7 +2001,7 @@ def main() -> None:
             print(
                 "[checkpoint] new best feasible: "
                 f"Task BD-rate={task_bd_rate:+.3f}% "
-                f"mean BPP ratio={mean_bpp_ratio:.3f}"
+                f"mean BPP ratio={mean_bpp_ratio} accuracy_feasible={accuracy_feasible}"
             )
         metric_updates = {
             "loss": new_best_loss,
@@ -1928,11 +2021,11 @@ def main() -> None:
 
         primary_improved = should_save_primary_checkpoint(
             metric_updates[args.checkpoint_metric],
-            rate_dual_enabled=args.rate_dual_control,
+            rate_dual_enabled=guarded_selection,
             new_best_feasible=new_best_feasible,
         )
         if (
-            not args.rate_dual_control
+            not guarded_selection
             and args.checkpoint_metric == "task_bd_rate"
             and task_bd_rate is None
             and not (output_dir / "best.pt").exists()
@@ -1963,7 +2056,7 @@ def main() -> None:
             )
 
     require_feasible_rate_dual_result(
-        args.rate_dual_control, best_feasible_task_bd_rate
+        guarded_selection, best_feasible_task_bd_rate
     )
 
 

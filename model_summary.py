@@ -66,6 +66,8 @@ def parse_args() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument("--swin-qp-embed-dim", type=int, default=64)
+    parser.add_argument("--swin-gated-smoothing", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--swin-smoothing-max-strength", type=float, default=0.5)
     parser.add_argument("--max-residual", type=float, default=0.25)
 
     parser.add_argument("--proxy-checkpoint")
@@ -119,6 +121,8 @@ def main() -> None:
             ),
             swin_qp_conditioning=args.swin_qp_conditioning,
             swin_qp_embed_dim=args.swin_qp_embed_dim,
+            swin_gated_smoothing=args.swin_gated_smoothing,
+            swin_smoothing_max_strength=args.swin_smoothing_max_strength,
             max_residual=args.max_residual,
         )
         show(

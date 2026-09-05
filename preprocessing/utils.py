@@ -46,6 +46,16 @@ def save_checkpoint(path: str | Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def validate_run_directory(output_dir: str | Path, resume: str | None) -> None:
+    """Prevent stale best checkpoints from making a new, infeasible run look valid."""
+    output = Path(output_dir).resolve()
+    if resume is not None:
+        if Path(resume).resolve().parent != output:
+            raise ValueError("--resume must use its original --output-dir; use --init-checkpoint for a new run")
+    elif output.is_dir() and any(output.glob("*.pt")):
+        raise ValueError(f"{output} already contains checkpoints; choose a new --output-dir or --resume")
+
+
 def write_json(path: str | Path, payload: Any) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

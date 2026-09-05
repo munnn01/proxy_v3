@@ -1,0 +1,42 @@
+# Experimental target, not a claim of -10% Task BD-rate.
+# Inference remains video -> Swin -> standard codec -> frozen analyzer.
+--preprocessor swin
+--swin-qp-conditioning
+--swin-qp-embed-dim 64
+--swin-gated-smoothing
+--swin-smoothing-max-strength 0.5
+--max-residual 0.10
+--codec h264
+--codec-qps 30 35 40 45
+# Real decoded pixels and real BPP in every training forward pass.
+--train-codec-source real
+--alpha 10
+--rate-lambda 0
+--distortion-reconstruction-weight 1.0
+--ce-weight 1.0
+--kd-weight 0.5
+--kd-temperature 2.0
+--feature-weight 0.05
+--feature-layer layer4
+--max-top1-drop-pp 0.0
+--mask-rate-weight 0.25
+--mask-rate-target output
+--mask-rate-layer layer4
+--mask-rate-outside-weight 0.0
+--mask-rate-temporal-weight 0.25
+--mask-rate-temporal-target residual
+--rate-dual-control
+--target-bpp-ratio 0.95
+--rate-dual-parity-lambda 0.05
+--rate-dual-kappa 3.0
+--rate-dual-ema-beta 0.8
+--rate-dual-min 0.0001
+--rate-dual-max 10.0
+--rate-dual-max-proxy-underestimate-percent 10.0
+--rate-dual-proxy-guard-patience 1
+--dual-feasibility-tolerance 0.005
+--optimizer adamw
+--weight-decay 0.01
+--lr 0.00005
+--clip-grad 1.0
+--checkpoint-metric task_bd_rate

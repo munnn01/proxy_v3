@@ -294,6 +294,8 @@ def main() -> None:
         # Checkpoints created before QP conditioning have no FiLM parameters.
         swin_qp_conditioning=bool(saved_args.get("swin_qp_conditioning", False)),
         swin_qp_embed_dim=int(saved_args.get("swin_qp_embed_dim", 64)),
+        swin_gated_smoothing=bool(saved_args.get("swin_gated_smoothing", False)),
+        swin_smoothing_max_strength=float(saved_args.get("swin_smoothing_max_strength", 0.5)),
         max_residual=float(saved_args.get("max_residual", 0.25)),
     ).to(device).eval()
     preprocessor.load_state_dict(checkpoint["preprocessor"])

@@ -535,17 +535,19 @@ def _mask_rate_args(target: str) -> SimpleNamespace:
     )
 
 
-def _run_mask_rate_epoch(target: str) -> dict[str, float]:
+def _run_mask_rate_epoch(target: str, temporal_target: str = "same") -> dict[str, float]:
     torch.manual_seed(0)
     clips = torch.rand(2, 2, 3, 8, 8)
     labels = torch.zeros(2, dtype=torch.long)
     loader = DataLoader(TensorDataset(clips, labels), batch_size=2, shuffle=False)
+    args = _mask_rate_args(target)
+    args.mask_rate_temporal_target = temporal_target
     return run_epoch(
         loader,
         _RecordingPreprocessor(),
         _ValidationCodec(),
         _FeatureAnalyzer(),
-        args=_mask_rate_args(target),
+        args=args,
         device=torch.device("cpu"),
     )
 
@@ -556,6 +558,11 @@ def test_masked_rate_penalty_is_zero_for_an_identity_residual():
 
 def test_masked_rate_penalty_charges_detail_in_the_output():
     assert _run_mask_rate_epoch("output")["mask_rate"] > 0.01
+
+
+def test_temporal_target_can_differ_from_spatial_residual_target():
+    assert _run_mask_rate_epoch("residual", "same")["mask_rate"] == 0
+    assert _run_mask_rate_epoch("residual", "output")["mask_rate"] > 0
 
 
 def test_preset_lines_drop_comments_and_split_inline_values():

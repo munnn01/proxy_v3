@@ -251,6 +251,8 @@ def build_preprocessor(
     swin_qp_conditioning: bool = True,
     swin_qp_embed_dim: int = 64,
     max_residual: float = 0.25,
+    swin_gated_smoothing: bool = False,
+    swin_smoothing_max_strength: float = 0.5,
 ) -> nn.Module:
     """Construct a preprocessor from checkpoint/CLI-friendly arguments."""
 
@@ -264,6 +266,8 @@ def build_preprocessor(
             qp_conditioning=swin_qp_conditioning,
             qp_embed_dim=swin_qp_embed_dim,
             max_residual=max_residual,
+            gated_smoothing=swin_gated_smoothing,
+            smoothing_max_strength=swin_smoothing_max_strength,
         )
     if kind == "vit":
         return VideoTransformerPreprocessor(
@@ -276,3 +280,30 @@ def build_preprocessor(
     if kind == "cnn":
         return PaperPreprocessor(temporal_frames=temporal_frames)
     raise ValueError(f"unknown preprocessor {kind!r}; choose 'swin', 'vit', or 'cnn'")
+
+
+def preprocessor_from_checkpoint(checkpoint: dict) -> nn.Module:
+    """Rebuild the inference model using saved arguments, including legacy defaults."""
+    args = checkpoint.get("args", {})
+    model = build_preprocessor(
+        args.get("preprocessor", "cnn"),
+        temporal_frames=int(args.get("temporal_frames", 8)),
+        patch_size=int(args.get("vit_patch_size", 8)),
+        embed_dim=int(args.get("vit_embed_dim", 96)),
+        depth=int(args.get("vit_depth", 4)),
+        num_heads=int(args.get("vit_heads", 4)),
+        swin_patch_size=int(args.get("swin_patch_size", 4)),
+        swin_embed_dim=int(args.get("swin_embed_dim", 48)),
+        swin_depth=int(args.get("swin_depth", 4)),
+        swin_num_heads=int(args.get("swin_heads", 4)),
+        swin_window_size=(int(args.get("swin_window_temporal", 4)),
+                          int(args.get("swin_window_spatial", 8)),
+                          int(args.get("swin_window_spatial", 8))),
+        swin_qp_conditioning=bool(args.get("swin_qp_conditioning", False)),
+        swin_qp_embed_dim=int(args.get("swin_qp_embed_dim", 64)),
+        swin_gated_smoothing=bool(args.get("swin_gated_smoothing", False)),
+        swin_smoothing_max_strength=float(args.get("swin_smoothing_max_strength", 0.5)),
+        max_residual=float(args.get("max_residual", 0.25)),
+    )
+    model.load_state_dict(checkpoint["preprocessor"])
+    return model

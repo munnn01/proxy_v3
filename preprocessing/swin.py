@@ -340,6 +340,8 @@ class VideoSwinLitePreprocessor(nn.Module):
         qp_conditioning: bool = True,
         qp_embed_dim: int = 64,
         default_qp: float = 35.0,
+        gated_smoothing: bool = False,
+        smoothing_max_strength: float = 0.5,
     ) -> None:
         super().__init__()
         if patch_size < 1:
@@ -354,6 +356,10 @@ class VideoSwinLitePreprocessor(nn.Module):
             raise ValueError("qp_embed_dim must be positive")
         if not 0.0 <= default_qp <= 51.0:
             raise ValueError("default_qp must be in [0, 51]")
+        if not 0.0 < smoothing_max_strength <= 1.0:
+            raise ValueError("smoothing_max_strength must be in (0, 1]")
+        self.gated_smoothing = bool(gated_smoothing)
+        self.smoothing_max_strength = float(smoothing_max_strength)
         self.patch_size = patch_size
         self.embed_dim = embed_dim
         self.depth = depth
@@ -404,6 +410,7 @@ class VideoSwinLitePreprocessor(nn.Module):
             self.qp_films = nn.ModuleList()
             self.qp_residual_gate = None
         self.normalization = nn.LayerNorm(embed_dim)
+        self.smoothing_head = nn.Conv3d(embed_dim, 1, 1) if gated_smoothing else None
         self.to_rgb = nn.ConvTranspose3d(
             embed_dim,
             3,
@@ -413,6 +420,9 @@ class VideoSwinLitePreprocessor(nn.Module):
         self.apply(self._initialize_transformer)
         nn.init.zeros_(self.to_rgb.weight)
         nn.init.zeros_(self.to_rgb.bias)
+        if self.smoothing_head is not None:
+            nn.init.zeros_(self.smoothing_head.weight)
+            nn.init.zeros_(self.smoothing_head.bias)
         if self.qp_residual_gate is not None:
             # sigmoid(2) ~= 0.88: start close to the configured max residual
             # while retaining a hard [0, 1] QP-dependent gate.
@@ -504,5 +514,20 @@ class VideoSwinLitePreprocessor(nn.Module):
             residual = residual * gate[:, :, None, None, None]
         residual = residual[..., :height, :width]
         source = clip.permute(0, 2, 1, 3, 4)
+        if self.smoothing_head is not None:
+            from .filters import spatial_lowpass
+
+            gate_logits = F.interpolate(
+                self.smoothing_head(features), size=channel_first.shape[2:],
+                mode="trilinear", align_corners=False,
+            )[..., :height, :width]
+            # Choose the right derivative at zero explicitly. Clamp/ReLU boundary
+            # derivatives can otherwise leave a zero-initialized gate unable to learn.
+            smoothing = torch.where(
+                gate_logits >= 0, torch.tanh(gate_logits), torch.zeros_like(gate_logits)
+            )
+            smoothing = smoothing * self.smoothing_max_strength
+            lowpass = spatial_lowpass(clip).permute(0, 2, 1, 3, 4)
+            source = source + smoothing * (lowpass - source)
         output = (source + residual).clamp(0.0, 1.0)
         return output.permute(0, 2, 1, 3, 4)

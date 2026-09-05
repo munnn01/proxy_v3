@@ -1,5 +1,12 @@
 # Video Swin Lite v3: direct-rate preprocessing with reliable Task BD-rate evaluation
 
+The experimental V6 workflow is documented in [KAGGLE_V6_VI.md](KAGGLE_V6_VI.md).
+It preserves the inference pipeline, adds optional gated spatial smoothing and
+temporal-residual regularization, fits proxy log-BPP and paired rate changes on
+preprocessor outputs, and checks real per-QP accuracy as well as BPP before saving
+the primary checkpoint. The -10% Task BD-rate objective remains an experiment target,
+not a measured result. Existing defaults and older inference checkpoints remain supported.
+
 Task-aware video preprocessing with the requested pipeline kept intact:
 
 ```text
