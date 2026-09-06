@@ -467,6 +467,19 @@ precompute limits.
 
 Ready-to-run Kaggle cells are in [KAGGLE_GUIDE_VI.md](KAGGLE_GUIDE_VI.md).
 
+For a V6 run stopped by the frozen-proxy BPP guard, use
+[`kaggle_cells/v6_refresh_resume.ipynb`](kaggle_cells/v6_refresh_resume.ipynb)
+or its [Python cells](kaggle_cells/v6_refresh_resume.py). The recipe snapshots the
+latest working `last.pt`, refines the existing proxy on that Swin's outputs, and
+uses `--resume --refresh-proxy-on-resume --proxy-checkpoint NEW_PROXY` to continue
+the next Swin epoch. Optimizer, scheduler, AMP scaler, rate multipliers, and
+real-rate EMA history are restored. Only the proxy guard history resets, after
+the new proxy passes real-codec controller validation using the existing guard
+thresholds. Failed pre-training validation leaves `last.pt` unchanged. Each
+subsequent checkpoint records both proxy hashes and the refresh validation drift.
+Ordinary `--resume` still rejects a changed proxy. Calibration does not establish
+that proxy gradients are accurate or that the Task BD-rate target has been met.
+
 ```bash
 python model_summary.py \
   --model all \

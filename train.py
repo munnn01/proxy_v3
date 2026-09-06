@@ -7,7 +7,7 @@ import hashlib
 import json
 import math
 import random
-from copy import copy
+from copy import copy, deepcopy
 from pathlib import Path
 
 import torch
@@ -533,6 +533,73 @@ def should_save_primary_checkpoint(
     return new_best_feasible if rate_dual_enabled else selected_metric_improved
 
 
+def validate_resume_proxy(
+    checkpoint: dict[str, object], proxy_path: str, proxy_sha256: str, *, refresh: bool
+) -> bool:
+    """Keep ordinary resume strict; require a verifiable new proxy for refresh."""
+
+    old_hash = checkpoint.get("proxy_sha256")
+    old_args = checkpoint.get("args", {})
+    if refresh:
+        if not isinstance(old_hash, str) or not old_hash:
+            raise ValueError("proxy refresh requires a resume checkpoint with proxy_sha256")
+        if old_hash == proxy_sha256:
+            raise ValueError(
+                "--refresh-proxy-on-resume requires newly calibrated proxy weights; "
+                "omit the flag for ordinary continuation with the same proxy"
+            )
+        return True
+    if old_hash is not None and old_hash != proxy_sha256:
+        raise ValueError(
+            "resume changed frozen proxy weights; use --refresh-proxy-on-resume "
+            "after recalibration, or --init-checkpoint in a new run"
+        )
+    if old_args.get("proxy_checkpoint", proxy_path) != proxy_path:
+        raise ValueError("resume changed --proxy-checkpoint; use the saved proxy path")
+    return False
+
+
+def validate_refreshed_proxy(
+    state: dict[str, object],
+    anchor_metrics: dict[str, float],
+    proposed_metrics: dict[str, float],
+    codec_qps: list[int],
+    *,
+    maximum_allowed_ratio: float,
+    max_underestimate_percent: float,
+    patience: int,
+) -> tuple[dict[str, object], dict[int, float]]:
+    """Reset only proxy guard history after real-codec validation accepts a refresh.
+
+    Work on a copy so a failed validation leaves the resumed controller untouched.
+    Real-rate multipliers and EMA history remain valid across proxy replacements.
+    """
+
+    ratios, _ = validation_bpp_ratios(anchor_metrics, proposed_metrics, codec_qps)
+    drifts = {}
+    for qp in codec_qps:
+        real_bpp = float(proposed_metrics[f"qp{qp}_bpp"])
+        proxy_bpp = float(proposed_metrics[f"qp{qp}_proxy_bpp"])
+        if not math.isfinite(real_bpp) or real_bpp <= 0:
+            raise ValueError(f"proxy refresh real BPP at QP {qp} must be positive and finite")
+        if not math.isfinite(proxy_bpp) or proxy_bpp <= 0:
+            raise ValueError(f"proxy refresh predicted BPP at QP {qp} must be positive and finite")
+        drifts[qp] = 100.0 * (proxy_bpp / real_bpp - 1.0)
+    refreshed_state = deepcopy(state)
+    bad_qps, _ = update_rate_dual_proxy_guard(
+        refreshed_state, ratios, drifts,
+        maximum_allowed_ratio=maximum_allowed_ratio,
+        max_underestimate_percent=max_underestimate_percent,
+        patience=patience,
+    )
+    if bad_qps:
+        raise RuntimeError(
+            f"refreshed proxy failed real-codec validation at QPs {bad_qps}: "
+            f"drift_percent={drifts}; no training step or resume checkpoint was changed"
+        )
+    return refreshed_state, drifts
+
+
 def require_feasible_rate_dual_result(
     rate_dual_enabled: bool, best_feasible_task_bd_rate: float
 ) -> None:
@@ -566,7 +633,7 @@ class PresetArgumentParser(argparse.ArgumentParser):
         return line.split() if line else []
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> PresetArgumentParser:
     parser = PresetArgumentParser(description=__doc__, fromfile_prefix_chars="@")
     data = parser.add_argument_group("data")
     data.add_argument("--data-root", help="root containing train/ and optionally val/ folders")
@@ -799,6 +866,11 @@ def parse_args() -> argparse.Namespace:
     runtime.add_argument("--output-dir", default="checkpoints")
     runtime.add_argument("--resume")
     runtime.add_argument(
+        "--refresh-proxy-on-resume", action="store_true",
+        help="resume Swin/optimizer/controller with a newly calibrated frozen proxy; "
+        "requires direct-rate control and real-codec validation before training",
+    )
+    runtime.add_argument(
         "--checkpoint-metric",
         choices=("task_bd_rate", "loss", "top1", "ce"),
         default="task_bd_rate",
@@ -807,7 +879,11 @@ def parse_args() -> argparse.Namespace:
     runtime.add_argument("--seed", type=int, default=42)
     runtime.add_argument("--device", default="cuda")
     runtime.add_argument("--smoke-test", action="store_true")
-    return parser.parse_args()
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
 
 
 def resolve_data_directories(args: argparse.Namespace) -> tuple[Path, Path | None]:
@@ -1390,6 +1466,8 @@ def main() -> None:
     validate_run_directory(args.output_dir, args.resume)
     if args.init_checkpoint and args.resume:
         raise ValueError("choose --init-checkpoint for a new run or --resume for continuation")
+    if args.refresh_proxy_on_resume and not (args.resume and args.rate_dual_control):
+        raise ValueError("--refresh-proxy-on-resume requires --resume and --rate-dual-control")
     if args.max_top1_drop_pp is not None:
         if not math.isfinite(args.max_top1_drop_pp) or args.max_top1_drop_pp < 0:
             raise ValueError("--max-top1-drop-pp must be finite and non-negative")
@@ -1662,13 +1740,16 @@ def main() -> None:
     best_task_bd_rate = float("inf")
     best_feasible_task_bd_rate = float("inf")
     checkpoint: dict[str, object] | None = None
+    proxy_refresh_pending = False
+    proxy_refresh_history: list[dict[str, object]] = []
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         old_args = checkpoint.get("args", {})
-        if checkpoint.get("proxy_sha256", proxy_sha256) != proxy_sha256:
-            raise ValueError("resume changed frozen proxy weights; use --init-checkpoint in a new run")
-        if old_args.get("proxy_checkpoint", args.proxy_checkpoint) != args.proxy_checkpoint:
-            raise ValueError("resume changed --proxy-checkpoint; use --init-checkpoint in a new run")
+        proxy_refresh_pending = validate_resume_proxy(
+            checkpoint, args.proxy_checkpoint, proxy_sha256,
+            refresh=args.refresh_proxy_on_resume,
+        )
+        proxy_refresh_history = deepcopy(checkpoint.get("proxy_refresh_history", []))
         for name, default in (("max_top1_drop_pp", None),
                               ("mask_rate_temporal_weight", 1.0),
                               ("mask_rate_temporal_target", "same"),
@@ -1684,6 +1765,8 @@ def main() -> None:
         if "scaler" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = int(checkpoint["epoch"]) + 1
+        if proxy_refresh_pending and args.epochs < start_epoch:
+            raise ValueError(f"--epochs must be at least {start_epoch} to continue after proxy refresh")
         best_loss = float(checkpoint.get("best_val_loss", best_loss))
         best_ce = float(checkpoint.get("best_val_ce", best_ce))
         best_top1 = float(checkpoint.get("best_val_top1", best_top1))
@@ -1772,6 +1855,32 @@ def main() -> None:
                 ),
                 proxy_guard_patience=args.rate_dual_proxy_guard_patience,
             )
+
+    if proxy_refresh_pending:
+        assert checkpoint is not None and rate_dual_state is not None
+        args.qp_to_rate_dual_weight = rate_dual_weights(rate_dual_state, args.codec_qps)
+        print("[proxy-refresh] validating new proxy on resumed Swin with real codec before training")
+        refresh_metrics = run_epoch(val_loader, preprocessor, codec, analyzer, args, device)
+        rate_dual_state, refresh_drifts = validate_refreshed_proxy(
+            rate_dual_state, anchor_metrics, refresh_metrics, args.codec_qps,
+            maximum_allowed_ratio=(args.target_bpp_ratio + 2.0 * args.dual_feasibility_tolerance),
+            max_underestimate_percent=args.rate_dual_max_proxy_underestimate_percent,
+            patience=args.rate_dual_proxy_guard_patience,
+        )
+        refresh_event = {
+            "after_epoch": start_epoch - 1,
+            "previous_proxy_sha256": checkpoint["proxy_sha256"],
+            "proxy_sha256": proxy_sha256,
+            "proxy_checkpoint": str(args.proxy_checkpoint),
+            "previous_guard_streak": checkpoint["rate_dual_state"].get("proxy_guard_streak", 0),
+            "proxy_drift_percent_by_qp": refresh_drifts,
+        }
+        proxy_refresh_history.append(refresh_event)
+        print(
+            f"[proxy-refresh] accepted drift_percent={refresh_drifts}; "
+            f"continuing epoch {start_epoch} with restored optimizer/scheduler/scaler "
+            "and unchanged rate-dual weights/EMA"
+        )
 
     for epoch in range(start_epoch, args.epochs + 1):
         proxy_guard_abort = False
@@ -1982,6 +2091,7 @@ def main() -> None:
             "rate_dual_state": rate_dual_state,
             "proxy_checkpoint": str(args.proxy_checkpoint),
             "proxy_sha256": proxy_sha256,
+            "proxy_refresh_history": proxy_refresh_history,
             "args": vars(args),
             "train_metrics": train_metrics,
             "val_metrics": val_metrics,
