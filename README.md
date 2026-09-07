@@ -481,6 +481,17 @@ actual checkpoint score stops with an explanatory error. Explicit paths can be
 passed with `--checkpoint`, `--manifest`, and `--clean`; to deliberately evaluate
 a different checkpoint, set `--expected-controller-bd-rate` to its recorded score.
 
+For the next rate-recovery experiment without changing the VideoSwinLite
+architecture, use [`kaggle_cells/v7_rate_recovery.ipynb`](kaggle_cells/v7_rate_recovery.ipynb).
+It locates the actual −6.687% best-task checkpoint and its hash-matched proxy,
+creates a deterministic 800-clip controller from the unused training pool, and
+recalibrates the proxy on that checkpoint's outputs using online real H.264.
+It then starts a new five-epoch run with `--init-checkpoint`, target BPP ratio
+0.95, learning rate 1e-5, direct per-QP rate control, and a zero Top-1-drop
+guard. The old optimizer and dual state are not resumed. Finally it evaluates
+the feasible checkpoint, or labels the best-task fallback as diagnostic, on the
+saved full validation at seven QPs. This recipe needs no precomputed codec cache.
+
 For a V6 run stopped by the frozen-proxy BPP guard, use
 [`kaggle_cells/v6_refresh_resume.ipynb`](kaggle_cells/v6_refresh_resume.ipynb)
 or its [Python cells](kaggle_cells/v6_refresh_resume.py). The recipe snapshots the
