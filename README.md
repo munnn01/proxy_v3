@@ -467,6 +467,20 @@ precompute limits.
 
 Ready-to-run Kaggle cells are in [KAGGLE_GUIDE_VI.md](KAGGLE_GUIDE_VI.md).
 
+To evaluate the saved Swin checkpoint whose controller Task BD-rate rounds to
+−6.687%, run [`kaggle_cells/evaluate_best_task_from_inputs.ipynb`](kaggle_cells/evaluate_best_task_from_inputs.ipynb).
+Attach the latest Output containing `swin_ratio_090/best_task_bd_rate.pt`, the
+`checking` dataset containing `v5_fixed_split/split_manifest.json`, and
+`kineticscleaned`. Real-codec evaluation does not need a proxy checkpoint or
+codec cache. The helper restores exact full-validation membership, preserves
+checkpoint clip/codec settings, and measures both H.264 methods at seven QPs
+without a sample limit. It reports BPP/Top-1 per QP and Task BD-rate with a paired
+video bootstrap interval. Full validation includes the controller and is a
+development result, not an independent test. An older Input with a different
+actual checkpoint score stops with an explanatory error. Explicit paths can be
+passed with `--checkpoint`, `--manifest`, and `--clean`; to deliberately evaluate
+a different checkpoint, set `--expected-controller-bd-rate` to its recorded score.
+
 For a V6 run stopped by the frozen-proxy BPP guard, use
 [`kaggle_cells/v6_refresh_resume.ipynb`](kaggle_cells/v6_refresh_resume.ipynb)
 or its [Python cells](kaggle_cells/v6_refresh_resume.py). The recipe snapshots the
