@@ -75,9 +75,10 @@ def prepare(source_root=None):
     return run
 
 
-def loss_overrides(mode="relative_mse"):
+def loss_overrides(mode="relative_mse", feature_weights_by_qp=None):
     common = {"epochs": 2, "lr": 1e-5, "target_bpp_ratio": 0.95,
-              "validate_initial": False, "initial_validation_only": False}
+              "validate_initial": False, "initial_validation_only": False,
+              "feature_weights_by_qp": feature_weights_by_qp}
     if mode == "legacy":
         return {**common, "feature_loss": "cosine", "feature_layers": ["layer4"],
                 "feature_layer_weights": [1.0], "feature_weight": 0.05}
@@ -87,9 +88,17 @@ def loss_overrides(mode="relative_mse"):
             "feature_layer_weights": [0.3, 0.7], "feature_weight": 0.05}
 
 
-def baseline(run):
+def feature_run(run, mode="relative_mse", feature_weights_by_qp=None):
+    name = "feature_legacy" if mode == "legacy" else "feature_relative_mse"
+    if feature_weights_by_qp is not None:
+        name += "_by_qp"
+    return replace(run, swin_dir=run.root / name)
+
+
+def baseline(run, mode="relative_mse", feature_weights_by_qp=None):
+    run = feature_run(run, mode, feature_weights_by_qp)
     arguments = recovery.training_arguments(run, run.starting_proxy, {
-        **loss_overrides(), "initial_validation_only": True,
+        **loss_overrides(mode, feature_weights_by_qp), "initial_validation_only": True,
     })
     recovery.run_script(run, "train.py", *arguments)
     path = run.swin_dir / "initial_validation.json"
@@ -97,10 +106,10 @@ def baseline(run):
     return path
 
 
-def train(run, mode="relative_mse"):
-    if mode == "legacy":
-        run = replace(run, swin_dir=run.root / "feature_legacy")
+def train(run, mode="relative_mse", feature_weights_by_qp=None):
+    run = feature_run(run, mode, feature_weights_by_qp)
     candidate, feasible = recovery.fine_tune(run, run.starting_proxy, {
-        **loss_overrides(mode), "validate_initial": not (run.swin_dir / "initial_validation.json").is_file(),
+        **loss_overrides(mode, feature_weights_by_qp),
+        "validate_initial": not (run.swin_dir / "initial_validation.json").is_file(),
     })
     return candidate, feasible

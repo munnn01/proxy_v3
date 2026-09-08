@@ -24,10 +24,32 @@ def feature_configuration(args):
     return layers, [w / sum(weights) for w in weights], mode
 
 
+def feature_weight_map(args):
+    """Absolute feature coefficients, aligned with codec_qps; scalar fallback for old runs."""
+    qps = list(getattr(args, "codec_qps", [30, 35, 40, 45]))
+    if not qps or len(set(qps)) != len(qps):
+        raise ValueError("feature weights require nonempty, unique codec QPs")
+    weights = getattr(args, "feature_weights_by_qp", None)
+    weights = list(weights) if weights is not None else [float(getattr(args, "feature_weight", 0.0))] * len(qps)
+    if len(weights) != len(qps) or any(not math.isfinite(w) or w < 0 for w in weights):
+        raise ValueError("--feature-weights-by-qp requires one finite nonnegative weight per --codec-qps entry")
+    return dict(zip(qps, weights, strict=True))
+
+
+def feature_weight_for_qp(args, qp):
+    if getattr(args, "feature_weights_by_qp", None) is None:
+        return float(getattr(args, "feature_weight", 0.0))
+    return feature_weight_map(args)[qp]
+
+
+def feature_enabled(args):
+    return any(w > 0 for w in feature_weight_map(args).values())
+
+
 def validate_feature_resume(saved, current):
     """Changing the objective requires a fresh optimizer/controller run."""
     previous = SimpleNamespace(**saved)
-    if (float(getattr(previous, "feature_weight", 0.0)) != float(current.feature_weight)
+    if (feature_weight_map(previous) != feature_weight_map(current)
             or feature_configuration(previous) != feature_configuration(current)):
         raise ValueError("resume changed feature objective; use --init-checkpoint in a new output directory")
 

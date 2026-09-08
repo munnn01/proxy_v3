@@ -503,6 +503,15 @@ to obtain a same-controller baseline. See the [paper review and limitations](doc
 for equations, source pages, and how to run the legacy control. No BD-rate gain
 is claimed by this code change.
 
+For the per-QP feature-weight experiment, run
+[`v8_qp_feature_ablation.ipynb`](kaggle_cells/v8_qp_feature_ablation.ipynb).
+`--codec-qps 30 35 40 45 --feature-weights-by-qp 0.03 0.04 0.06 0.07`
+replaces the scalar `--feature-weight` with absolute coefficients in the declared
+QP order. This experimental allocation has mean 0.05 under uniform QP sampling;
+it is not an automatic controller or a demonstrated BD-rate improvement. Feature
+coefficients and weighted losses are logged per QP. Changing the effective weights
+with `--resume` is rejected; start a new run with `--init-checkpoint`.
+
 For a V6 run stopped by the frozen-proxy BPP guard, use
 [`kaggle_cells/v6_refresh_resume.ipynb`](kaggle_cells/v6_refresh_resume.ipynb)
 or its [Python cells](kaggle_cells/v6_refresh_resume.py). The recipe snapshots the

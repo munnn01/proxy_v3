@@ -10,6 +10,7 @@ from torch.nn import functional as F
 import train
 from preprocessing.feature_distillation import (
     feature_configuration, feature_distillation, validate_feature_resume,
+    feature_weight_map, feature_weight_for_qp,
 )
 
 
@@ -73,7 +74,8 @@ def test_resume_accepts_legacy_but_rejects_feature_objective_changes():
         validate_feature_resume(saved, current)
 
 
-def test_forward_loss_backpropagates_both_layers_to_preprocessor_only():
+@pytest.mark.parametrize("qp,weight", [(30, 0.0), (35, 0.04), (40, 0.06), (45, 0.07)])
+def test_forward_loss_backpropagates_both_layers_to_preprocessor_only(qp, weight):
     class Analyzer(nn.Module):
         def __init__(self):
             super().__init__()
@@ -84,6 +86,9 @@ def test_forward_loss_backpropagates_both_layers_to_preprocessor_only():
             logits = f.mean((1, 2, 3, 4)).unsqueeze(1).expand(-1, 5)
             return logits, {name: f * (i + 1) for i, name in enumerate(layers)}
 
+        def forward(self, clips):
+            return self.forward_with_features(clips, [])[0]
+
     class Preprocessor(nn.Module):
         def __init__(self):
             super().__init__()
@@ -93,23 +98,58 @@ def test_forward_loss_backpropagates_both_layers_to_preprocessor_only():
             return x * self.gain
 
     class Codec(nn.Module):
+        def set_qp(self, qp):
+            pass
+
         def forward(self, x, codec_source):
             return x, x.mean((1, 2, 3, 4))
 
-    args = SimpleNamespace(feature_weight=.05, feature_layers=["a", "b"],
+    args = SimpleNamespace(feature_weight=0., feature_layers=["a", "b"],
+                           codec_qps=[30, 35, 40, 45], feature_weights_by_qp=[0., .04, .06, .07],
                            feature_layer_weights=[.3, .7], feature_loss="relative_mse",
-                           alpha=0., qp_to_rate_lambda={30: 0.}, ce_weight=0., kd_weight=0.)
+                           alpha=0., qp_to_rate_lambda={q: 0. for q in [30, 35, 40, 45]},
+                           ce_weight=0., kd_weight=0., amp=False)
+    assert train.clean_feature_layers(args) == ["a", "b"]
     analyzer, preprocessor = Analyzer(), Preprocessor()
     clips = torch.rand(2, 2, 3, 4, 4)
     _, clean = analyzer.forward_with_features(clips, ["a", "b"])
     losses = train.forward_losses(clips, torch.zeros(2, dtype=torch.long), preprocessor,
-                                  Codec(), analyzer, args, False, 30, clean_features=clean)
-    assert losses["feature_loss_a"].item() == pytest.approx(.04)
-    assert losses["feature_loss_b"].item() == pytest.approx(.04)
-    assert losses["total"].item() == pytest.approx(.05 * .04)
+                                  Codec(), analyzer, args, False, qp,
+                                  clean_features=clean if weight else None)
+    assert losses["feature_loss_a"].item() == pytest.approx(.04 if weight else 0.)
+    assert losses["feature_loss_b"].item() == pytest.approx(.04 if weight else 0.)
+    assert losses["total"].item() == pytest.approx(weight * .04)
+    assert losses["feature_loss_weighted"].item() == pytest.approx(weight * .04)
     losses["total"].backward()
-    assert preprocessor.gain.grad < 0
+    assert preprocessor.gain.grad.item() == pytest.approx(-.4 * weight)
     assert analyzer.gain.grad is None
+    metrics = train.run_epoch([(clips, torch.zeros(2, dtype=torch.long))], preprocessor,
+                              Codec(), analyzer, args, torch.device("cpu"))
+    for q, w in zip(args.codec_qps, args.feature_weights_by_qp):
+        assert metrics[f"qp{q}_feature_weight"] == w
+        assert metrics[f"qp{q}_feature_loss_weighted"] == pytest.approx(w * .04)
+
+
+def test_qp_weights_follow_declared_order_and_override_scalar():
+    args = SimpleNamespace(codec_qps=[45, 30], feature_weight=999., feature_weights_by_qp=[.07, .03])
+    assert feature_weight_map(args) == {45: .07, 30: .03}
+    assert feature_weight_for_qp(args, 30) == .03
+
+
+@pytest.mark.parametrize("weights", [[.03], [.03, -.1], [.03, float("nan")], [.03, float("inf")]])
+def test_invalid_qp_weights_rejected(weights):
+    with pytest.raises(ValueError, match="one finite nonnegative"):
+        feature_weight_map(SimpleNamespace(codec_qps=[30, 45], feature_weights_by_qp=weights))
+
+
+def test_resume_compares_effective_qp_weights():
+    saved = {"feature_weight": .05, "codec_qps": [30, 35, 40, 45]}
+    current = SimpleNamespace(**saved, feature_weights_by_qp=[.05] * 4)
+    current.feature_weight = 0.  # Ignored because explicit per-QP weights are present.
+    validate_feature_resume(saved, current)
+    current.feature_weights_by_qp[-1] = .07
+    with pytest.raises(ValueError, match="init-checkpoint"):
+        validate_feature_resume(saved, current)
 
 
 def test_initial_validation_only_measures_loaded_weights_without_training(tmp_path, monkeypatch):
@@ -172,3 +212,7 @@ def test_v8_and_legacy_control_differ_only_in_feature_objective(tmp_path, monkey
     assert old["resume"] is None and new["resume"] is None
     assert new["init_checkpoint"] == str(run.checkpoint)
     assert new["epochs"] == 2 and new["lr"] == 1e-5 and new["target_bpp_ratio"] == .95
+    qp = vars(train.build_parser().parse_args(training_arguments(
+        run, run.starting_proxy, loss_overrides(feature_weights_by_qp=[.03, .04, .06, .07]))))
+    assert {key for key in new if new[key] != qp[key]} == {"feature_weights_by_qp"}
+    assert feature_weight_map(SimpleNamespace(**qp)) == {30: .03, 35: .04, 40: .06, 45: .07}

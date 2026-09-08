@@ -98,3 +98,30 @@ checkpoint V6 -6.687% và manifest checking. Không train proxy lại. Không c�
 - Full validation chỉ gọi khi cần xác nhận ứng viên. Full validation cũ đã được
   dùng để phân tích trước đây, không trở thành test độc lập nhờ đổi controller.
 - Không chạy tiếp target 0.93 tự động, không bảo đảm đạt -10%.
+
+## Thử phân bổ feature weight theo QP
+
+Notebook `kaggle_cells/v8_qp_feature_ablation.ipynb` dùng cùng Inputs và cấu hình
+relative MSE hai tầng, nhưng đặt hệ số feature tuyệt đối theo QP:
+
+| QP | 30 | 35 | 40 | 45 |
+|---|---:|---:|---:|---:|
+| Feature weight | 0.03 | 0.04 | 0.06 | 0.07 |
+
+Thay `0.05 * L_feature` trong công thức trên bằng `feature_weight[QP] * L_feature`.
+Trung bình hệ số vẫn là 0.05 nếu lấy mẫu QP đều; điều này không đảm bảo cùng độ lớn
+loss hay gradient trung bình. Đây là giả thuyết giữ feature mạnh hơn ở QP cao,
+không phải bộ hệ số tối ưu trích từ bài báo. Feature loss mạnh hơn cũng có thể
+làm tăng bitrate; rate-dual tiếp tục điều khiển riêng từng QP theo BPP H.264 thật.
+CE/KD, tỷ lệ hai tầng 0.3/0.7, target 0.95 và learning rate không đổi.
+
+CLI: `--feature-weights-by-qp 0.03 0.04 0.06 0.07` theo đúng thứ tự
+`--codec-qps 30 35 40 45`. Các giá trị thay thế hệ số chung, không nhân tiếp 0.05.
+Không truyền tùy chọn này thì vẫn dùng hệ số chung như trước. Giá trị 0 tắt feature
+loss tại QP tương ứng. Checkpoint/log lưu hệ số và feature loss đã nhân hệ số theo QP.
+
+Để tách tác dụng của phân bổ QP, đối chứng phù hợp là relative MSE hai tầng với
+hệ số chung 0.05, cùng khởi tạo/proxy/split/seed. So sánh trực tiếp với legacy
+cosine đồng thời đổi cả dạng loss và phân bổ nên không xác định riêng tác dụng QP.
+Cell đánh giá cuối notebook chạy H.264 thật trên full validation 7 QP, kể cả ứng
+viên chỉ dùng chẩn đoán; `feasible=False` được giữ nguyên nhãn, không coi là đạt mục tiêu.

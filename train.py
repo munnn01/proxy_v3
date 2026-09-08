@@ -33,6 +33,7 @@ from preprocessing.data import (
 from preprocessing.evaluation import calculate_bd_rate
 from preprocessing.feature_distillation import (
     feature_configuration, feature_distillation, validate_feature_resume,
+    feature_enabled, feature_weight_for_qp, feature_weight_map,
 )
 from preprocessing.standard_codec import require_ffmpeg
 from preprocessing.utils import (
@@ -217,7 +218,7 @@ def clean_feature_layers(args: argparse.Namespace) -> list[str]:
     """Return the analyzer layers that must be captured on the clean clip."""
 
     layers: list[str] = []
-    if float(getattr(args, "feature_weight", 0.0)) > 0:
+    if feature_enabled(args):
         layers.extend(feature_configuration(args)[0])
     if float(getattr(args, "mask_rate_weight", 0.0)) > 0:
         layers.append(str(getattr(args, "mask_rate_layer", "layer4")))
@@ -756,6 +757,8 @@ def build_parser() -> PresetArgumentParser:
                               help="feature modules; overrides legacy --feature-layer")
     optimization.add_argument("--feature-layer-weights", nargs="+", type=float,
                               help="relative layer weights, normalized to sum to one")
+    optimization.add_argument("--feature-weights-by-qp", nargs="+", type=float,
+                              help="Absolute feature coefficients in --codec-qps order; overrides --feature-weight")
     optimization.add_argument("--feature-loss", choices=("cosine", "mse", "relative_mse"),
                               default="cosine", help="feature distance; cosine preserves the legacy objective")
     optimization.add_argument(
@@ -998,7 +1001,7 @@ def forward_losses(
     report_proxy_rate: bool = False,
 ) -> dict[str, torch.Tensor]:
     device_type = clips.device.type
-    feature_weight = float(getattr(args, "feature_weight", 0.0))
+    feature_weight = feature_weight_for_qp(args, qp)
     feature_layers, feature_weights, feature_mode = feature_configuration(args)
     with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=use_amp):
         processed = preprocessor(clips, qp)
@@ -1059,7 +1062,8 @@ def forward_losses(
             ) * (temperature * temperature)
 
         feature_loss = logits.new_zeros((), dtype=torch.float32)
-        feature_terms = {}
+        # Keep logging keys available when this QP disables feature matching.
+        feature_terms = {layer: feature_loss for layer in feature_layers}
         if feature_weight > 0:
             if clean_features is None:
                 raise ValueError("feature matching is enabled but clean features are missing")
@@ -1179,7 +1183,7 @@ def run_epoch(
     )
     meters = {name: AverageMeter() for name in meter_names}
     feature_meter_names = ["feature_loss_weighted"]
-    if float(getattr(args, "feature_weight", 0.0)) > 0:
+    if feature_enabled(args):
         feature_meter_names.extend(f"feature_loss_{layer}" for layer in feature_configuration(args)[0])
     meters.update({name: AverageMeter() for name in feature_meter_names})
     correct1 = correct5 = examples = 0
@@ -1194,6 +1198,7 @@ def run_epoch(
                 "rate_ratio",
                 "proxy_bpp",
                 "proxy_rate_ratio",
+                "feature_loss_weighted",
             )
         }
         for qp in args.codec_qps
@@ -1312,6 +1317,9 @@ def run_epoch(
                 correct5 += top5
                 examples += batch
                 if not training:
+                    per_qp_meters[qp]["feature_loss_weighted"].update(
+                        float(losses["feature_loss_weighted"].detach()), batch
+                    )
                     per_qp_meters[qp]["loss"].update(loss_value, batch)
                     per_qp_meters[qp]["monitor_loss"].update(monitor_value, batch)
                     per_qp_meters[qp]["bpp"].update(bpp_value, batch)
@@ -1356,6 +1364,8 @@ def run_epoch(
     if not training:
         for qp in args.codec_qps:
             qp_examples = per_qp_correct[qp]["examples"]
+            metrics[f"qp{qp}_feature_weight"] = feature_weight_for_qp(args, qp)
+            metrics[f"qp{qp}_feature_loss_weighted"] = per_qp_meters[qp]["feature_loss_weighted"].average
             metrics[f"qp{qp}_loss"] = per_qp_meters[qp]["loss"].average
             metrics[f"qp{qp}_monitor_loss"] = per_qp_meters[qp][
                 "monitor_loss"
@@ -1514,6 +1524,7 @@ def main() -> None:
         raise ValueError("--distortion-reconstruction-weight must be in [0, 1]")
     if any(not math.isfinite(w) or w < 0 for w in (args.ce_weight, args.kd_weight, args.feature_weight)):
         raise ValueError("CE, KD and feature weights must be finite and non-negative")
+    feature_weight_map(args)
     if args.kd_temperature <= 0:
         raise ValueError("--kd-temperature must be positive")
     if args.mask_rate_weight < 0:
@@ -1585,7 +1596,7 @@ def main() -> None:
     print(
         "[setup] task objective "
         f"CE={args.ce_weight} KD={args.kd_weight} T={args.kd_temperature} "
-        f"feature={args.feature_weight}@{feature_configuration(args)} "
+        f"feature_by_qp={feature_weight_map(args)}@{feature_configuration(args)} "
         f"distortion_eta={args.distortion_reconstruction_weight}"
     )
     if args.mask_rate_weight > 0:
@@ -1954,6 +1965,7 @@ def main() -> None:
             f"\n[epoch {epoch}/{args.epochs}] {args.codec.upper()} "
             f"mixed QPs={args.codec_qps} lambdas={args.qp_to_rate_lambda} "
             f"mask_weights={args.qp_to_mask_rate_weight} "
+            f"feature_weights={feature_weight_map(args)} "
             f"rate_dual_weights={args.qp_to_rate_dual_weight}"
         )
         train_metrics = run_epoch(
@@ -2138,6 +2150,7 @@ def main() -> None:
             "codec_qp": args.codec_qps[len(args.codec_qps) // 2],
             "codec_qps": list(args.codec_qps),
             "rate_lambdas_by_qp": dict(args.qp_to_rate_lambda),
+            "feature_weights_by_qp": feature_weight_map(args),
             "mask_rate_weights_by_qp": dict(args.qp_to_mask_rate_weight),
             "dual_state": dual_state,
             "rate_dual_weights_by_qp": dict(args.qp_to_rate_dual_weight),
