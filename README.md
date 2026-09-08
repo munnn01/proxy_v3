@@ -492,6 +492,17 @@ guard. The old optimizer and dual state are not resumed. Finally it evaluates
 the feasible checkpoint, or labels the best-task fallback as diagnostic, on the
 saved full validation at seven QPs. This recipe needs no precomputed codec cache.
 
+After the completed V7 run, the optional
+[`v8_feature_ablation.ipynb`](kaggle_cells/v8_feature_ablation.ipynb) reuses its
+proxy and exact 800-video controller, measures the original V6 checkpoint before
+training, and runs a two-epoch multi-layer feature-loss experiment. The default
+training loss remains the legacy layer4 cosine distance. Opt in with
+`--feature-loss relative_mse --feature-layers layer3 layer4 --feature-layer-weights 0.3 0.7`.
+Use `--validate-initial` or `--initial-validation-only` with `--init-checkpoint`
+to obtain a same-controller baseline. See the [paper review and limitations](docs/feature_loss_review_vi.md)
+for equations, source pages, and how to run the legacy control. No BD-rate gain
+is claimed by this code change.
+
 For a V6 run stopped by the frozen-proxy BPP guard, use
 [`kaggle_cells/v6_refresh_resume.ipynb`](kaggle_cells/v6_refresh_resume.ipynb)
 or its [Python cells](kaggle_cells/v6_refresh_resume.py). The recipe snapshots the

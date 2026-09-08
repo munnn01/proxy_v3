@@ -293,7 +293,7 @@ def saved_training_cli(saved: dict, overrides: dict, parser) -> list[str]:
     return result
 
 
-def fine_tune(run: RecoveryRun, proxy: Path) -> tuple[Path, bool]:
+def training_arguments(run: RecoveryRun, proxy: Path, experiment_overrides=None) -> list[str]:
     os.chdir(run.project)
     sys.path.insert(0, str(run.project))
     import train as training
@@ -326,7 +326,12 @@ def fine_tune(run: RecoveryRun, proxy: Path) -> tuple[Path, bool]:
         "checkpoint_metric": "task_bd_rate", "output_dir": str(run.swin_dir),
         "smoke_test": False,
     }
-    arguments = saved_training_cli(run.saved_args, overrides, parser)
+    overrides.update(experiment_overrides or {})
+    return saved_training_cli(run.saved_args, overrides, parser)
+
+
+def fine_tune(run: RecoveryRun, proxy: Path, experiment_overrides=None) -> tuple[Path, bool]:
+    arguments = training_arguments(run, proxy, experiment_overrides)
     outcome = run_script(run, "train.py", *arguments, check=False)
     import torch
     last = run.swin_dir / "last.pt"
@@ -335,9 +340,10 @@ def fine_tune(run: RecoveryRun, proxy: Path) -> tuple[Path, bool]:
     last_payload = torch.load(last, map_location="cpu", weights_only=False)
     if last_payload.get("val_metrics", {}).get("rate_dual_proxy_guard_abort"):
         raise RuntimeError("Proxy guard aborted rate recovery; do not evaluate this run")
-    if int(last_payload.get("epoch", 0)) != FINETUNE_EPOCHS:
+    expected_epochs = int((experiment_overrides or {}).get("epochs", FINETUNE_EPOCHS))
+    if int(last_payload.get("epoch", 0)) != expected_epochs:
         raise RuntimeError(
-            f"Fine-tuning stopped at epoch {last_payload.get('epoch')} of {FINETUNE_EPOCHS}"
+            f"Fine-tuning stopped at epoch {last_payload.get('epoch')} of {expected_epochs}"
         )
     feasible = run.swin_dir / "best_feasible.pt"
     diagnostic = run.swin_dir / "best_task_bd_rate.pt"

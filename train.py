@@ -31,6 +31,9 @@ from preprocessing.data import (
     stratified_split_indices,
 )
 from preprocessing.evaluation import calculate_bd_rate
+from preprocessing.feature_distillation import (
+    feature_configuration, feature_distillation, validate_feature_resume,
+)
 from preprocessing.standard_codec import require_ffmpeg
 from preprocessing.utils import (
     AverageMeter,
@@ -215,7 +218,7 @@ def clean_feature_layers(args: argparse.Namespace) -> list[str]:
 
     layers: list[str] = []
     if float(getattr(args, "feature_weight", 0.0)) > 0:
-        layers.append(str(getattr(args, "feature_layer", "layer4")))
+        layers.extend(feature_configuration(args)[0])
     if float(getattr(args, "mask_rate_weight", 0.0)) > 0:
         layers.append(str(getattr(args, "mask_rate_layer", "layer4")))
     return list(dict.fromkeys(layers))
@@ -749,6 +752,12 @@ def build_parser() -> PresetArgumentParser:
         default="layer4",
         help="named frozen-analyzer module used for feature matching",
     )
+    optimization.add_argument("--feature-layers", nargs="+",
+                              help="feature modules; overrides legacy --feature-layer")
+    optimization.add_argument("--feature-layer-weights", nargs="+", type=float,
+                              help="relative layer weights, normalized to sum to one")
+    optimization.add_argument("--feature-loss", choices=("cosine", "mse", "relative_mse"),
+                              default="cosine", help="feature distance; cosine preserves the legacy objective")
     optimization.add_argument(
         "--mask-rate-weight",
         type=float,
@@ -865,6 +874,10 @@ def build_parser() -> PresetArgumentParser:
     runtime = parser.add_argument_group("runtime")
     runtime.add_argument("--output-dir", default="checkpoints")
     runtime.add_argument("--resume")
+    runtime.add_argument("--validate-initial", action="store_true",
+                         help="measure the initialized checkpoint on this controller before any updates")
+    runtime.add_argument("--initial-validation-only", action="store_true",
+                         help="write initial_validation.json and return without training; requires --init-checkpoint")
     runtime.add_argument(
         "--refresh-proxy-on-resume", action="store_true",
         help="resume Swin/optimizer/controller with a newly calibrated frozen proxy; "
@@ -986,7 +999,7 @@ def forward_losses(
 ) -> dict[str, torch.Tensor]:
     device_type = clips.device.type
     feature_weight = float(getattr(args, "feature_weight", 0.0))
-    feature_layer = str(getattr(args, "feature_layer", "layer4"))
+    feature_layers, feature_weights, feature_mode = feature_configuration(args)
     with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=use_amp):
         processed = preprocessor(clips, qp)
         reconstructed, bpp = codec(processed, codec_source=codec_source)
@@ -997,7 +1010,7 @@ def forward_losses(
             _, proxy_bpp = codec.proxy(processed, qp)
         if feature_weight > 0:
             logits, reconstructed_features = analyzer.forward_with_features(
-                reconstructed, [feature_layer]
+                reconstructed, feature_layers
             )
         else:
             logits = analyzer(reconstructed)
@@ -1046,18 +1059,13 @@ def forward_losses(
             ) * (temperature * temperature)
 
         feature_loss = logits.new_zeros((), dtype=torch.float32)
+        feature_terms = {}
         if feature_weight > 0:
-            if clean_features is None or feature_layer not in clean_features:
+            if clean_features is None:
                 raise ValueError("feature matching is enabled but clean features are missing")
-            proposed_feature = F.normalize(
-                reconstructed_features[feature_layer].float(), dim=1
+            feature_loss, feature_terms = feature_distillation(
+                reconstructed_features, clean_features, feature_layers, feature_weights, feature_mode,
             )
-            reference_feature = F.normalize(
-                clean_features[feature_layer].float(), dim=1
-            )
-            feature_loss = 1.0 - (
-                proposed_feature * reference_feature
-            ).sum(dim=1).mean()
 
         mask_rate_loss = logits.new_zeros((), dtype=torch.float32)
         qp_weights = getattr(args, "qp_to_mask_rate_weight", {})
@@ -1128,6 +1136,8 @@ def forward_losses(
         "ce_loss": ce_loss,
         "kd_loss": kd_loss,
         "feature_loss": feature_loss,
+        "feature_loss_weighted": feature_weight * feature_loss,
+        **{f"feature_loss_{layer}": value for layer, value in feature_terms.items()},
         "mask_rate_loss": mask_rate_loss,
         "logits": logits,
     }
@@ -1168,6 +1178,10 @@ def run_epoch(
         "clean_ce",
     )
     meters = {name: AverageMeter() for name in meter_names}
+    feature_meter_names = ["feature_loss_weighted"]
+    if float(getattr(args, "feature_weight", 0.0)) > 0:
+        feature_meter_names.extend(f"feature_loss_{layer}" for layer in feature_configuration(args)[0])
+    meters.update({name: AverageMeter() for name in feature_meter_names})
     correct1 = correct5 = examples = 0
     clean_correct1 = clean_correct5 = clean_examples = 0
     per_qp_meters = {
@@ -1291,6 +1305,8 @@ def run_epoch(
                 meters["ce_loss"].update(float(losses["ce_loss"].detach()), batch)
                 meters["kd_loss"].update(float(losses["kd_loss"].detach()), batch)
                 meters["feature_loss"].update(float(losses["feature_loss"].detach()), batch)
+                for name in feature_meter_names:
+                    meters[name].update(float(losses[name].detach()), batch)
                 meters["mask_rate"].update(float(losses["mask_rate_loss"].detach()), batch)
                 correct1 += top1
                 correct5 += top5
@@ -1336,6 +1352,7 @@ def run_epoch(
         metrics["clean_ce"] = meters["clean_ce"].average
         metrics["clean_top1"] = clean_correct1 / max(clean_examples, 1)
         metrics["clean_top5"] = clean_correct5 / max(clean_examples, 1)
+    metrics.update({name: meters[name].average for name in feature_meter_names})
     if not training:
         for qp in args.codec_qps:
             qp_examples = per_qp_correct[qp]["examples"]
@@ -1466,6 +1483,9 @@ def main() -> None:
     validate_run_directory(args.output_dir, args.resume)
     if args.init_checkpoint and args.resume:
         raise ValueError("choose --init-checkpoint for a new run or --resume for continuation")
+    if (args.validate_initial or args.initial_validation_only) and not args.init_checkpoint:
+        raise ValueError("initial validation requires --init-checkpoint in a new run")
+    feature_configuration(args)
     if args.refresh_proxy_on_resume and not (args.resume and args.rate_dual_control):
         raise ValueError("--refresh-proxy-on-resume requires --resume and --rate-dual-control")
     if args.max_top1_drop_pp is not None:
@@ -1492,8 +1512,8 @@ def main() -> None:
         raise ValueError("--codec-qps must contain values in [0, 51]")
     if not 0.0 <= args.distortion_reconstruction_weight <= 1.0:
         raise ValueError("--distortion-reconstruction-weight must be in [0, 1]")
-    if args.ce_weight < 0 or args.kd_weight < 0 or args.feature_weight < 0:
-        raise ValueError("CE, KD and feature weights must be non-negative")
+    if any(not math.isfinite(w) or w < 0 for w in (args.ce_weight, args.kd_weight, args.feature_weight)):
+        raise ValueError("CE, KD and feature weights must be finite and non-negative")
     if args.kd_temperature <= 0:
         raise ValueError("--kd-temperature must be positive")
     if args.mask_rate_weight < 0:
@@ -1565,7 +1585,7 @@ def main() -> None:
     print(
         "[setup] task objective "
         f"CE={args.ce_weight} KD={args.kd_weight} T={args.kd_temperature} "
-        f"feature={args.feature_weight}@{args.feature_layer} "
+        f"feature={args.feature_weight}@{feature_configuration(args)} "
         f"distortion_eta={args.distortion_reconstruction_weight}"
     )
     if args.mask_rate_weight > 0:
@@ -1745,6 +1765,7 @@ def main() -> None:
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         old_args = checkpoint.get("args", {})
+        validate_feature_resume(old_args, args)
         proxy_refresh_pending = validate_resume_proxy(
             checkpoint, args.proxy_checkpoint, proxy_sha256,
             refresh=args.refresh_proxy_on_resume,
@@ -1881,6 +1902,38 @@ def main() -> None:
             f"continuing epoch {start_epoch} with restored optimizer/scheduler/scaler "
             "and unchanged rate-dual weights/EMA"
         )
+
+    if args.validate_initial or args.initial_validation_only:
+        print("[initial] evaluating the starting Swin on the same controller before optimizer updates")
+        # Avoid shifting the subsequent training sampler or augmentation RNG.
+        import numpy as np
+        random_state, numpy_state = random.getstate(), np.random.get_state()
+        try:
+            with torch.random.fork_rng(devices=list(range(torch.cuda.device_count()))):
+                initial_metrics = run_epoch(val_loader, preprocessor, codec, analyzer, args, device)
+        finally:
+            random.setstate(random_state)
+            np.random.set_state(numpy_state)
+        initial_metrics["task_bd_rate_percent"] = validation_task_bd_rate(
+            anchor_metrics, initial_metrics, args.codec_qps,
+        )
+        ratios, mean_ratio = validation_bpp_ratios(anchor_metrics, initial_metrics, args.codec_qps)
+        accuracy_ok, drops = validation_accuracy_guard(
+            anchor_metrics, initial_metrics, args.codec_qps, args.max_top1_drop_pp,
+        )
+        initial_metrics.update({"mean_bpp_ratio": mean_ratio, "accuracy_feasible": accuracy_ok})
+        initial_metrics.update({f"qp{qp}_bpp_ratio": ratio for qp, ratio in ratios.items()})
+        initial_metrics.update({f"qp{qp}_top1_drop_pp": drop for qp, drop in drops.items()})
+        write_json(output_dir / "initial_validation.json", {
+            "checkpoint": str(Path(args.init_checkpoint).resolve()),
+            "checkpoint_sha256": hashlib.sha256(Path(args.init_checkpoint).read_bytes()).hexdigest(),
+            "proxy_sha256": proxy_sha256, "args": vars(args),
+            "anchor_metrics": anchor_metrics, "val_metrics": initial_metrics,
+            "optimizer_updates": 0,
+        })
+        print(f"[initial] valid={initial_metrics}")
+        if args.initial_validation_only:
+            return
 
     for epoch in range(start_epoch, args.epochs + 1):
         proxy_guard_abort = False
